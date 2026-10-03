@@ -1,0 +1,18 @@
+ShubbleComms is MIT-licensed (see LICENSE). It depends on and, in release
+builds, bundles third-party components with their own licenses:
+
+- NAudio — audio output and file decoding. MIT.
+  https://github.com/naudio/NAudio
+
+- piper — offline neural text-to-speech, run as a separate process. MIT.
+  https://github.com/rhasspy/piper
+  piper's Windows builds include espeak-ng (GPLv3) for phonemization:
+  https://github.com/espeak-ng/espeak-ng
+
+- GLaDOS voice model — by dnhkng, MIT.
+  https://github.com/dnhkng/GLaDOS
+  https://huggingface.co/rokeya71/VITS-Piper-GlaDOS-en-onnx
+  Trained on Portal voice lines. (c) Valve Corporation. Included
+  non-commercially as fan content.
+
+Individual license texts ship in the licenses\ folder of the release archive.
