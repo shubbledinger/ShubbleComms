@@ -1,8 +1,8 @@
+![](screenshots/banner.png)
+
 # ShubbleComms
 
 Talk in voice chat without a microphone. ShubbleComms captures what you type, speaks it through a TTS voice, and plays the audio into a virtual microphone (such as ![VB-Audio Cable](https://vb-audio.com/Cable/index.htm)). Everything runs locally.
-
-![the radial soundboard](screenshots/wheel.png)
 
 ## Read this first
 
@@ -70,12 +70,14 @@ Both engines get the same rate, pitch, and shout sliders, and both support per-v
 
 ### Everything else
 
+![](screenshots/settings.png)
+
 - Multiple simultaneous outputs — tick several sound outputs and the voice goes to all of them
 - Every bind re-recordable: click the bind button, press a new key or mouse button
 - Themes (Dark, Matrix, Portal, Ice) — (not customizable for now, might include that functionality later)
 - Starts minimized to the tray; double-click the tray icon for settings
 
-![settings](screenshots/settings.png)
+![](screenshots/themes.png)
 
 ## Getting started
 
