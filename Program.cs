@@ -113,6 +113,10 @@ internal sealed class Settings
     public List<int> BindTyping { get; set; } = new() { 0x70, 0, 0, 0 };
     public List<int> BindStream { get; set; } = new() { 0x45, 1, 0, 0 };
     public List<int> BindRadial { get; set; } = new() { 0x04, 1, 0, 0 };   // Alt+MMB
+    public List<int> BindAddWord { get; set; } = new() { 0x44, 0, 1, 0 };  // Ctrl+D
+    public bool HelpSuggest { get; set; } = true;
+    public bool HelpCorrect { get; set; } = true;
+    public bool HelpPredict { get; set; } = true;
 }
 
 internal sealed class SettingsForm : Form
@@ -181,9 +185,10 @@ internal sealed class SettingsForm : Form
 
     // bind buttons double as the display: the button shows the current bind.
     // LMB = re-record, MMB/RMB = clear, Esc while recording = clear.
-    readonly Button _typingBind, _streamBind, _radialBind;
+    readonly Button _typingBind, _streamBind, _radialBind, _addWordBind;
 
     readonly CheckBox _streamWords, _releaseKeys, _tier1, _radialToggle;
+    readonly CheckBox _helpSuggest, _helpCorrect, _helpPredict;
 
     readonly TypingOverlay? _typingOverlay;
     readonly RadialOverlay? _radialOverlay;
@@ -201,11 +206,15 @@ internal sealed class SettingsForm : Form
         _typingBind = BindButton();
         _streamBind = BindButton();
         _radialBind = BindButton();
+        _addWordBind = BindButton();
 
         _streamWords = new CheckBox { Text = "stream words", AutoSize = true, ForeColor = Color.White };
         _releaseKeys = new CheckBox { Text = "release keys on close", AutoSize = true, ForeColor = Color.White, Checked = true };
         _tier1 = new CheckBox { Text = "Tier1 (experimental)", AutoSize = true, ForeColor = Color.White };
         _radialToggle = new CheckBox { Text = "radial toggle mode", AutoSize = true, ForeColor = Color.White };
+        _helpSuggest = new CheckBox { Text = "suggestions", AutoSize = true, ForeColor = Color.White };
+        _helpCorrect = new CheckBox { Text = "autocorrect", AutoSize = true, ForeColor = Color.White };
+        _helpPredict = new CheckBox { Text = "predict next word", AutoSize = true, ForeColor = Color.White };
 
         Text = "ShubbleComms";
         Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
@@ -277,11 +286,17 @@ internal sealed class SettingsForm : Form
         _releaseKeys.CheckedChanged += (s, e) => { _router.FlushOnClose = _releaseKeys.Checked; Save(); };
         _tier1.CheckedChanged += (s, e) => { _router.Tier1HoldAssert = _tier1.Checked; Save(); };
         _radialToggle.CheckedChanged += (s, e) => { _router.RadialToggle = _radialToggle.Checked; Save(); };
+        _helpSuggest.CheckedChanged += (s, e) => { _router.SuggestOn = _helpSuggest.Checked; Save(); };
+        _helpCorrect.CheckedChanged += (s, e) => { _router.CorrectOn = _helpCorrect.Checked; Save(); };
+        _helpPredict.CheckedChanged += (s, e) => { _router.PredictOn = _helpPredict.Checked; Save(); };
 
         _streamWords.Checked = _settings.StreamWords;
         _releaseKeys.Checked = _settings.FlushOnClose;
         _tier1.Checked = _settings.Tier1;
         _radialToggle.Checked = _settings.RadialToggle;
+        _helpSuggest.Checked = _settings.HelpSuggest;
+        _helpCorrect.Checked = _settings.HelpCorrect;
+        _helpPredict.Checked = _settings.HelpPredict;
 
         Theme.Init();
         foreach (string n in Theme.Names) _theme.Items.Add(n);
@@ -309,7 +324,7 @@ internal sealed class SettingsForm : Form
         };
         ApplyOutputs();
 
-        foreach (var (btn, slot) in new[] { (_typingBind, "typing"), (_streamBind, "stream"), (_radialBind, "radial") })
+        foreach (var (btn, slot) in new[] { (_typingBind, "typing"), (_streamBind, "stream"), (_radialBind, "radial"), (_addWordBind, "addword") })
         {
             Button b = btn; string which = slot;
             b.Click += (s, e) => ArmRecorder(b, which);
@@ -440,7 +455,7 @@ internal sealed class SettingsForm : Form
     GroupBox BindsGroup()
     {
         return Group("Key binds",
-            Row(Lbl("typing"), _typingBind, Lbl("stream"), _streamBind, Lbl("radial"), _radialBind),
+        Row(Lbl("typing"), _typingBind, Lbl("stream"), _streamBind, Lbl("radial"), _radialBind, Lbl("add"), _addWordBind),
             Row(_radialToggle, Hint("click to re-record · middle/right-click to clear · extra held modifiers are ignored")));
     }
 
@@ -448,13 +463,14 @@ internal sealed class SettingsForm : Form
     {
         return Group("Typing mode",
             Row(_streamWords, _releaseKeys, _tier1),
+            Row(_helpSuggest, _helpCorrect, _helpPredict),
             Row(
                 MkButton("clear message history", () =>
                 {
                     _router.ClearHistory();
                     try { File.Delete(HistoryPath); } catch { }
                 }),
-                Hint("Up/Down while typing cycles previously sent messages")));
+                Hint("Up/Down cycles sent messages · Tab completes + cycles suggestions · Shift+Tab backwards")));
     }
 
     GroupBox FilesGroup()
@@ -500,6 +516,8 @@ internal sealed class SettingsForm : Form
             _streamBind.Text = BindText(_router.BindStreamVk, _router.BindStreamAlt, _router.BindStreamCtrl, _router.BindStreamShift);
         if (_recTarget != _radialBind)
             _radialBind.Text = BindText(_router.RadialTriggerVk, _router.RadialAlt, _router.RadialCtrl, _router.RadialShift);
+        if (_recTarget != _addWordBind)
+            _addWordBind.Text = BindText(_router.BindAddWordVk, _router.BindAddWordAlt, _router.BindAddWordCtrl, _router.BindAddWordShift);
     }
 
     static string BindText(uint vk, bool alt, bool ctrl, bool shift)
@@ -539,6 +557,7 @@ internal sealed class SettingsForm : Form
         var zero = new List<int> { 0, 0, 0, 0 };
         if (slot == "typing") _settings.BindTyping = zero;
         else if (slot == "stream") _settings.BindStream = zero;
+        else if (slot == "addword") _settings.BindAddWord = zero;
         else _settings.BindRadial = zero;
         ApplyBinds(); UpdateBindLabels(); Save();
     }
@@ -557,6 +576,10 @@ internal sealed class SettingsForm : Form
         _router.RadialAlt = Val(_settings.BindRadial, 1, 1) != 0;
         _router.RadialCtrl = Val(_settings.BindRadial, 2, 0) != 0;
         _router.RadialShift = Val(_settings.BindRadial, 3, 0) != 0;
+        _router.BindAddWordVk = (uint)Val(_settings.BindAddWord, 0, 0x44);
+        _router.BindAddWordAlt = Val(_settings.BindAddWord, 1, 0) != 0;
+        _router.BindAddWordCtrl = Val(_settings.BindAddWord, 2, 1) != 0;
+        _router.BindAddWordShift = Val(_settings.BindAddWord, 3, 0) != 0;
     }
 
     static int Val(List<int> bind, int i, int fallback) =>
@@ -654,7 +677,11 @@ Everything runs locally. Nothing is uploaded anywhere, ever.
             _settings.BindTyping = new List<int> { (int)_router.BindTypingVk, _router.BindTypingAlt ? 1 : 0, _router.BindTypingCtrl ? 1 : 0, _router.BindTypingShift ? 1 : 0 };
             _settings.BindStream = new List<int> { (int)_router.BindStreamVk, _router.BindStreamAlt ? 1 : 0, _router.BindStreamCtrl ? 1 : 0, _router.BindStreamShift ? 1 : 0 };
             _settings.BindRadial = new List<int> { (int)_router.RadialTriggerVk, _router.RadialAlt ? 1 : 0, _router.RadialCtrl ? 1 : 0, _router.RadialShift ? 1 : 0 };
-
+            _settings.BindAddWord = new List<int> { (int)_router.BindAddWordVk, _router.BindAddWordAlt ? 1 : 0, _router.BindAddWordCtrl ? 1 : 0, _router.BindAddWordShift ? 1 : 0 };
+            _settings.HelpSuggest = _helpSuggest.Checked;
+            _settings.HelpCorrect = _helpCorrect.Checked;
+            _settings.HelpPredict = _helpPredict.Checked;
+            
             Directory.CreateDirectory(AppData.Folder);
             File.WriteAllText(SettingsPath,
                 JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
@@ -769,6 +796,7 @@ Everything runs locally. Nothing is uploaded anywhere, ever.
                 };
                 if (_recSlot == "typing") _settings.BindTyping = bind;
                 else if (_recSlot == "stream") _settings.BindStream = bind;
+                else if (_recSlot == "addword") _settings.BindAddWord = bind;
                 else _settings.BindRadial = bind;
             }
             else ClearBind(_recSlot ?? "typing");

@@ -23,7 +23,6 @@ internal static class Theme
 {
     public static Color Bg, Text, Spoken, SelBg, CaretBg, CaretFg;
     public static Color RadWedge, RadSel, RadCenter, RadNeedle;
-    public static Color TagStream, TagFull;
     public static bool Scanlines;
 
     public static string Current = "Dark";
@@ -110,8 +109,6 @@ internal static class Theme
         RadSel = Field(r, "radSel", RadSel);
         RadCenter = Field(r, "radCenter", RadCenter);
         RadNeedle = Field(r, "radNeedle", RadNeedle);
-        TagStream = Field(r, "tagStream", TagStream);
-        TagFull = Field(r, "tagFull", TagFull);
         Scanlines = Field(r, "scanlines", Scanlines);
         if (r.TryGetProperty("indicator", out var ind) && ind.ValueKind == JsonValueKind.String)
             _indicator = ind.GetString() ?? "text";

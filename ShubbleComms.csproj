@@ -15,5 +15,6 @@
     <PackageReference Include="System.Speech" Version="10.0.12" />
     <Content Include="icon.ico" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="aperture.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="dictionaries\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

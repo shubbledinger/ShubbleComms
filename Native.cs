@@ -18,7 +18,7 @@ internal static class Native
     public const uint RID_INPUT = 0x10000003;
 
     public const uint LLKHF_EXTENDED = 0x01;
-    public const uint VK_BACK = 0x08, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11,
+    public const uint VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11,
                      VK_MENU = 0x12, VK_CAPITAL = 0x14, VK_SPACE = 0x20;
     public const uint VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1, VK_LCONTROL = 0xA2,
                      VK_RCONTROL = 0xA3, VK_LMENU = 0xA4, VK_RMENU = 0xA5;

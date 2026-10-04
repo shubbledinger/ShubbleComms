@@ -8,22 +8,23 @@ using System.Text.Json;
 using System.Threading;
 using NAudio.Wave;
 
-// Piper — fully offline neural TTS, run as a subprocess. Put piper.exe (plus its
-// dlls and espeak-ng-data) and voice models (*.onnx + matching *.onnx.json) in a
-// "piper" folder next to the app, then hit "rescan voices".
+// Piper (https://github.com/rhasspy/piper) — fully offline neural TTS, run as a
+// subprocess. Drop piper.exe (plus its dlls / espeak-ng-data) and voice models
+// (*.onnx + matching *.onnx.json) into a "piper" folder next to the app, then hit
+// "rescan voices" in the settings window.
 //
 // One long-lived piper process keeps the model loaded, so each utterance only
 // costs synthesis time (~100-300ms) instead of a full process + model load
 // (~1s). We feed it one line of text at a time and read back one utterance per
 // line. Piper builds differ in what they write where, so the output mode is
 // probed once and remembered in piper\commspike-pipermode.txt:
-//   1. stdout WAV — a sync-scanning reader parses WAVs off stdout, tolerating
-//      any junk around them
+//   1. stdout WAV — a sync-scanning reader parses WAVs off stdout, skipping
+//      (and previewing) any junk around them
 //   2. --output_dir — piper writes one WAV per line into a private temp dir
 //      (both --output-dir and --output_dir spellings are tried)
 //   3. per-utterance — spawn piper.exe per phrase; slow but always works
 // Delete the remembered-mode file to force a re-probe (e.g. after updating
-// piper).
+// piper). Voice models live in the piper root or, tidier, in piper\voices.
 internal sealed class PiperTts : ITts
 {
     enum PiperMode { StdoutWav, OutputDir, PerUtterance }
@@ -36,7 +37,7 @@ internal sealed class PiperTts : ITts
     string[] _voices = Array.Empty<string>();
     string _model = "", _modelName = "";
     int _modelRate = 22050;
-    string _modelLang = "";   // e.g. "en-us" — from the model config, for #lang abbreviations
+    volatile string _modelLang = "";   // e.g. "en-us" — model config language, also picks the dictionary
     int _rate = 4;
     int _pitchPct;
     int _shoutPct = 15;
@@ -57,6 +58,7 @@ internal sealed class PiperTts : ITts
     public Action<byte[]>? OnSamples { get; set; }
     public string[] Voices => _voices;
     public string Dir => _dir;
+    public string Language => _modelLang;
 
     PiperTts(string dir)
     {
@@ -66,10 +68,14 @@ internal sealed class PiperTts : ITts
         LoadSavedMode();
         new Thread(() =>
         {
-            var cols = new[] { _fast, _slow };   // _fast is always drained first
+            // says always outrank preloads: _fast is checked first, every pass.
+            // The idle wait blocks on _slow with a short timeout — a say typed
+            // while both queues are empty is picked up within ~20ms, which
+            // vanishes next to render time anyway.
             while (true)
             {
-                if (BlockingCollection<Cmd>.TryTakeFromAny(cols, out var c, 500) < 0) continue;
+                if (!_fast.TryTake(out var c) && !_slow.TryTake(out c, 20))
+                    continue;
                 try { Handle(c); }
                 catch (Exception ex) { Log.Enqueue("piper error: " + ex.Message); }
             }
@@ -79,7 +85,7 @@ internal sealed class PiperTts : ITts
 
     public static string DefaultDir => Path.Combine(AppContext.BaseDirectory, "piper");
 
-    // null = no piper.exe found — SAPI-only until the user installs one and rescans
+    // null = piper.exe not found — SAPI-only until the user drops one in and rescans
     public static PiperTts? TryCreate()
     {
         foreach (var dir in new[] { DefaultDir, AppContext.BaseDirectory })
@@ -116,16 +122,7 @@ internal sealed class PiperTts : ITts
         catch { }
     }
 
-    // model files live in the piper root or in piper\voices — find whichever exists
-    string ResolveModel(string fileName)
-    {
-        string root = Path.Combine(_dir, fileName);
-        if (File.Exists(root)) return root;
-        string sub = Path.Combine(_dir, "voices", fileName);
-        return File.Exists(sub) ? sub : root;
-    }
-
-    // remembered output mode for this piper build
+    // remembers which rung of the ladder worked for THIS piper build
     string ModeFile => Path.Combine(_dir, "commspike-pipermode.txt");
 
     bool LoadSavedMode()
@@ -257,9 +254,6 @@ internal sealed class PiperTts : ITts
 
     // ---- rendering ----
 
-    // rate slider to speed factor: +10 → 1.4x faster, -10 → 0.6x
-    static double RateToSpeed(int rate) => Math.Clamp(1.0 + rate * 0.04, 0.55, 1.9);
-
     (byte[] pcm, int rate) Render(string text)
     {
         if (_mode != PiperMode.PerUtterance)
@@ -273,7 +267,7 @@ internal sealed class PiperTts : ITts
                 _mode = PiperMode.PerUtterance;
                 flipped = true;
                 PersistMode();
-                Log.Enqueue("piper persistent mode failing repeatedly — falling back to per-utterance");
+                Log.Enqueue("[piper] persistent mode failing repeatedly — falling back to per-utterance mode");
             }
             if (flipped)
             {
@@ -311,21 +305,21 @@ internal sealed class PiperTts : ITts
             if (_proc.Malformed)
             {
                 string junk = _proc.JunkReport();
-                Log.Enqueue("piper stream went bad mid-session — respawning" +
+                Log.Enqueue("[piper] persistent stream went bad mid-session — respawning" +
                             (junk.Length > 0 ? " (" + junk + ")" : ""));
                 _proc.Dispose(); _proc = null; _warmed = false;
                 _mode = PiperMode.PerUtterance;
                 PersistMode();
                 return null;
             }
-            Log.Enqueue("piper produced no audio for a line — respawning");
+            Log.Enqueue("[piper] no audio for line (timeout/crash) — respawning");
             _proc.Dispose(); _proc = null; _warmed = false;
         }
         return null;
     }
 
-    // Walk the strategy ladder until one rung warms up. The rung that works is
-    // remembered so restarts skip straight to it.
+    // strategy ladder: stdout WAV → --output-dir files (both spellings) → give up.
+    // the rung that works is persisted for next startup.
     bool EnsureWarmed()
     {
         if (_warmed && _proc != null && !_proc.IsDead) return true;
@@ -399,7 +393,7 @@ internal sealed class PiperTts : ITts
                     }
                     continue;
                 }
-                Log.Enqueue("piper --output_dir produced no files — falling back to per-utterance");
+                Log.Enqueue("piper --output_dir produced no files — falling back to per-utterance mode (slower, but works)");
                 _mode = PiperMode.PerUtterance;
                 PersistMode();
                 continue;
@@ -408,6 +402,15 @@ internal sealed class PiperTts : ITts
             break;   // per-utterance: nothing to warm
         }
         return false;
+    }
+
+    // model files live in the piper root or in piper\voices — find whichever exists
+    string ResolveModel(string fileName)
+    {
+        string root = Path.Combine(_dir, fileName);
+        if (File.Exists(root)) return root;
+        string sub = Path.Combine(_dir, "voices", fileName);
+        return File.Exists(sub) ? sub : root;
     }
 
     // piper is mono; if a model ever isn't, fold it down
@@ -510,6 +513,9 @@ internal sealed class PiperTts : ITts
         }
         return (rate, lang);
     }
+
+    // rate slider to speed factor: +10 → 1.4x faster, -10 → 0.6x
+    static double RateToSpeed(int rate) => Math.Clamp(1.0 + rate * 0.04, 0.55, 1.9);
 }
 
 // One long-lived piper.exe. We own its stdin (exactly one line in flight at a
@@ -518,9 +524,8 @@ internal sealed class PiperTts : ITts
 //   stdout, skipping (and previewing) any junk around the audio
 //   file mode — piper writes WAVs into a private output dir; we poll for the new
 //   file. stdout is still drained so the pipe can never fill and wedge piper.
-// stderr is drained continuously either way. Multi-sentence lines (a sentence
-// ender followed by more words) get a short settle window and a join, since
-// some builds write one file per sentence.
+// Multi-sentence lines (a sentence ender followed by more words) get a short
+// settle window and a join, since some builds write one file per sentence.
 sealed class PiperProc : IDisposable
 {
     readonly Process _p;
@@ -756,8 +761,8 @@ sealed class PiperProc : IDisposable
         return list;
     }
 
-    // a file counts as a frame only when it parses as a COMPLETE WAV — that's
-    // what makes half-written files safe to skip and retry
+    // a file counts as a frame only when it parses as a COMPLETE WAV —
+    // that's what makes half-written files safe to skip and retry
     static (byte[] pcm, int rate, int ch)? TryReadWavFile(string path)
     {
         try
@@ -794,8 +799,8 @@ sealed class PiperProc : IDisposable
 
     static string Ascii(byte[] b, int off, int len) => Encoding.ASCII.GetString(b, off, len);
 
-    // keep the error pipe empty (a full pipe would deadlock piper); keep the
-    // interesting lines for the log
+    // keep the error pipe empty (a full pipe would deadlock piper); surface the
+    // interesting lines — model load timings, errors — in the app log
     void DrainStderr()
     {
         try
@@ -949,7 +954,7 @@ sealed class WavSyncReader
     static string Ascii(byte[] b, int off, int len) => Encoding.ASCII.GetString(b, off, len);
 }
 
-// One ITts face over SAPI + piper. Voice names carry an engine prefix so a
+// one ITts face over SAPI + piper. Voice names carry an engine prefix so a
 // single dropdown picks the engine: "sapi — Microsoft Zira", "piper — glados".
 internal sealed class TtsRouter : ITts
 {
@@ -974,6 +979,7 @@ internal sealed class TtsRouter : ITts
         get => _onSamples;
         set { _onSamples = value; _cur.OnSamples = value; }
     }
+    public string Language => _cur.Language;
 
     public string[] Voices
     {
@@ -995,7 +1001,7 @@ internal sealed class TtsRouter : ITts
                 _piper = PiperTts.TryCreate();   // maybe it appeared since startup
                 if (_piper == null)
                 {
-                    Log.Enqueue("piper: piper.exe not found — it belongs in a 'piper' folder next to the app (see the README)");
+                    Log.Enqueue("piper: piper.exe not found — use the 'voices folder' button");
                     return;
                 }
             }

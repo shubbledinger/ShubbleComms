@@ -64,6 +64,30 @@ internal sealed class KeyboardRouter : IDisposable
     int _histDraftWord;              // its spoken-marker position, restored with it
     const int HistCap = 250;
 
+    // typing help: the dictionary engine does the heavy lifting, this is the
+    // hook-thread state machine for Tab cycling, plus the published snapshot
+    // fields the overlay renders
+    public readonly WordEngine Words;
+    public volatile bool SuggestOn = true, CorrectOn = true, PredictOn = true;
+    public volatile string[]? Suggestions;
+    public volatile int SuggestionIndex;      // -1 = none, >= 0 = Tab completion pending
+    public volatile int PendingStart = -1;    // word start of the pending completion
+    public volatile int PendingLen;           // fragment length inside it
+    public volatile string? AddWordHint;      // "Ctrl+D: add 'xyz'" for unknown words
+    public volatile int CorrectionStart = -1; // autocorrect flash: range + timestamp
+    public volatile int CorrectionLen;
+    public volatile int CorrectionTime;   // 32-bit clock — volatile long isn't legal in C#
+
+    readonly List<string> _sug = new();
+    int _sugIndex = -1;
+    bool _sugActive;
+    string _sugFragment = "";
+    bool _fixPending;                         // Backspace reverts the last autocorrect
+    int _fixStart, _fixLen;
+    string _fixTyped = "";
+    string _fixWord = "";                     // the corrected form — the revert's staleness check
+    string? _rejected;                        // reverted word — autocorrect leaves it alone this message
+
     public volatile Mode Mode = Mode.Game;
     public volatile bool Tier1HoldAssert = false;
     public volatile bool StreamWords = true;
@@ -84,6 +108,9 @@ internal sealed class KeyboardRouter : IDisposable
     public volatile bool BindStreamAlt = true, BindStreamCtrl, BindStreamShift;
     public volatile uint RadialTriggerVk = 0x04;   // middle mouse button
     public volatile bool RadialAlt = true, RadialCtrl, RadialShift;
+    // add-word bind — typing-mode only, not part of the global BindOwner set
+    public volatile uint BindAddWordVk = 0x44;     // D
+    public volatile bool BindAddWordAlt, BindAddWordCtrl = true, BindAddWordShift;
 
     // bind recorder: while armed, the next key or mouse button (plus whatever
     // modifiers are held) becomes the new bind. The settings window polls
@@ -115,6 +142,7 @@ internal sealed class KeyboardRouter : IDisposable
     public KeyboardRouter(ITts tts)
     {
         _tts = tts;
+        Words = new WordEngine(tts);
         _pump = new Thread(RunPump) { IsBackground = false, Name = "llhook" };
         _pump.Start();
         _ready.WaitOne();
@@ -195,7 +223,7 @@ internal sealed class KeyboardRouter : IDisposable
     // no-modifier bind matches even while Shift is held); the bind declaring
     // the MOST modifiers wins, so F1 and Shift+F1 can coexist as binds.
     // Key-form binds (vk >= 8) only answer keyboard events; mouse-form binds
-    // (vk 1-6) only mouse events — the callers pass the matching kind of vk.
+    // (vk 1-6) only to mouse events — the callers pass the matching kind of vk.
     // 0 = none, 1 = typing, 2 = stream, 3 = radial.
     int BindOwner(uint vk)
     {
@@ -458,6 +486,23 @@ internal sealed class KeyboardRouter : IDisposable
 
             bool full = !StreamWords;
 
+            // add-word bind (typing-mode only): the word at the cursor joins the
+            // dictionary. Swallowed only when the bind's modifiers actually match,
+            // so binding it to a plain letter still lets that letter type.
+            if (down && BindAddWordVk >= 0x08 && k.vkCode == BindAddWordVk &&
+                ModsMatch(BindAddWordAlt, BindAddWordCtrl, BindAddWordShift))
+            {
+                if (!_held.Contains(k.vkCode)) AddCurrentWord();
+                _held.Add(k.vkCode);
+                return (IntPtr)1;
+            }
+            if (up && BindAddWordVk >= 0x08 && k.vkCode == BindAddWordVk &&
+                ModsMatch(BindAddWordAlt, BindAddWordCtrl, BindAddWordShift))
+            {
+                _held.Remove(k.vkCode);
+                return (IntPtr)1;
+            }
+
             if (!IsCaptureKey(k.vkCode, full))
             {
                 if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
@@ -472,7 +517,8 @@ internal sealed class KeyboardRouter : IDisposable
 
                 if (k.vkCode == Native.VK_ESCAPE && !repeat)
                 {
-                    lock (_textLock) { ClearText(); BreakHist(); }   // Esc clears; the bind key closes
+                    lock (_textLock) { ClearText(); BreakHist(); _rejected = null; _fixPending = false; }
+                    UpdateSuggestions();
                     Snapshot();
                     return (IntPtr)1;
                 }
@@ -484,32 +530,65 @@ internal sealed class KeyboardRouter : IDisposable
                 bool ctrl = !altgr && (_ks[Native.VK_CONTROL] & 0x80) != 0;
                 bool shift = (_ks[Native.VK_SHIFT] & 0x80) != 0;
 
+                // any key except Backspace ends the "revert last autocorrect" window
+                if (k.vkCode != Native.VK_BACK) _fixPending = false;
+
                 switch (k.vkCode)
                 {
+                    // Tab: fill the word at the cursor with a suggestion — no space.
+                    // Tab again cycles forward, Shift+Tab backwards, Backspace
+                    // reverts to the typed fragment, space/Enter finalizes.
+                    case Native.VK_TAB:
+                        if (repeat) break;
+                        CycleSuggestion(shift ? -1 : 1);
+                        break;
+
+                    // space: finalize a pending completion as plain text, autocorrect
+                    // the word if it's unknown and confidently fixable, then a plain
+                    // space — space is ALWAYS just a space, never a hidden completion
                     case Native.VK_SPACE:
                         lock (_textLock)
                         {
                             BreakHist();
-                            if (full) { DeleteSel(); _text.Insert(_cursor, " "); _cursor++; _anchor = _cursor; }
-                            else { _text.Append(' '); _anchor = _cursor = _text.Length; SubmitWord(); }
+                            if (_sugActive) FinishSuggestion();
+                            if (full)
+                            {
+                                CorrectWordAtCursor(true);
+                                DeleteSel();
+                                _text.Insert(_cursor, " ");
+                                _cursor++;
+                                _anchor = _cursor;
+                            }
+                            else
+                            {
+                                CorrectWordAtCursor(true);
+                                _text.Append(' ');
+                                _anchor = _cursor = _text.Length;
+                                SubmitWord();
+                            }
                         }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
                     case Native.VK_RETURN:
                         if (repeat) break;
+                        string sent;
                         lock (_textLock)
                         {
-                            string message = _text.ToString().Trim();
-                            if (StreamWords) { SubmitWord(); ClearText(); }
-                            else
-                            {
-                                if (message.Length > 0) _tts?.Speak(message);
-                                ClearText();
-                            }
-                            AppendHistory(message);
+                            if (_sugActive) FinishSuggestion();
+                            if (StreamWords) SubmitWordCorrected();
+                            else CorrectWordAtCursor(false);
+                            sent = _text.ToString().Trim();
+                            if (!StreamWords && sent.Length > 0) _tts?.Speak(sent);
+                            ClearText();
+                            AppendHistory(sent);
+                            if (sent.Length > 0) Words.Learn(sent);
                         }
                         BreakHist();
+                        _rejected = null;               // new message — fresh correction
+                        _fixPending = false;           // revert state must not survive the message
+                        UpdateSuggestions();
                         Snapshot();
                         ToggleTyping();
                         break;
@@ -518,20 +597,64 @@ internal sealed class KeyboardRouter : IDisposable
                         lock (_textLock)
                         {
                             BreakHist();
-                            if (ctrl)
+                            bool handled = false;
+                            if (_sugActive)
                             {
-                                int target = WordBack(_cursor);
-                                _text.Remove(target, _cursor - target);
-                                _cursor = _anchor = target;
+                                // backspace on a pending completion: back to the typed fragment
+                                (int s, int e) = WordBounds();
+                                _text.Remove(s, e - s);
+                                _text.Insert(s, _sugFragment);
+                                _cursor = _anchor = s + _sugFragment.Length;
+                                _sugActive = false;
+                                handled = true;
                             }
-                            else if (full && _anchor != _cursor) DeleteSel();
-                            else if (_cursor > _wordStart)
+                            else if (_fixPending)
                             {
-                                _cursor--;
-                                _text.Remove(_cursor, 1);
-                                _anchor = _cursor;
+                                _fixPending = false;
+                                // staleness check: the revert only fires if the text at
+                                // the stored offsets still IS the corrected word. Enter
+                                // and Up/Down can swap the text out from under stale
+                                // offsets — a bogus revert there deletes whatever now
+                                // sits at those positions (spaces included).
+                                bool live = _fixStart >= 0 && _fixStart + _fixLen <= _text.Length &&
+                                            string.Equals(_text.ToString(_fixStart, _fixLen), _fixWord,
+                                                          StringComparison.Ordinal);
+                                if (live)
+                                {
+                                    // restore the typed word, keep the space, and let the
+                                    // cursor RIDE the edit: it was already past the word and
+                                    // its trailing space when the revert fired ("dick X" at
+                                    // position 5) — so it stays there, just shifted by the
+                                    // length change of the swap ("nick X", not "nickX").
+                                    int delta = _fixTyped.Length - _fixLen;
+                                    _text.Remove(_fixStart, _fixLen);
+                                    _text.Insert(_fixStart, _fixTyped);
+                                    _cursor = Math.Clamp(_cursor + delta, _fixStart + _fixTyped.Length, _text.Length);
+                                    _anchor = _cursor;
+                                    _rejected = _fixTyped.ToLowerInvariant();
+                                    CorrectionStart = -1;
+                                    handled = true;
+                                }
+                                // stale: drop it and run a normal backspace
+                            }
+                            if (!handled)
+                            {
+                                if (ctrl)
+                                {
+                                    int target = WordBack(_cursor);
+                                    _text.Remove(target, _cursor - target);
+                                    _cursor = _anchor = target;
+                                }
+                                else if (full && _anchor != _cursor) DeleteSel();
+                                else if (_cursor > _wordStart)
+                                {
+                                    _cursor--;
+                                    _text.Remove(_cursor, 1);
+                                    _anchor = _cursor;
+                                }
                             }
                         }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
@@ -547,18 +670,21 @@ internal sealed class KeyboardRouter : IDisposable
                                 _text.Remove(_cursor, Math.Min(to, _text.Length) - _cursor);
                             }
                         }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
                     case Native.VK_HOME:
                         if (!full) break;
                         lock (_textLock) { _cursor = _wordStart; if (!shift) _anchor = _cursor; }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
                     case Native.VK_END:
                         if (!full) break;
                         lock (_textLock) { _cursor = _text.Length; if (!shift) _anchor = _cursor; }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
@@ -568,11 +694,13 @@ internal sealed class KeyboardRouter : IDisposable
                         if (ctrl && full)
                         {
                             lock (_textLock) { _cursor = _wordStart; if (!shift) _anchor = _cursor; }
+                            UpdateSuggestions();
                             Snapshot();
                         }
                         else if (!ctrl)
                         {
                             HistoryStep(-1);
+                            UpdateSuggestions();
                         }
                         break;
 
@@ -580,11 +708,13 @@ internal sealed class KeyboardRouter : IDisposable
                         if (ctrl && full)
                         {
                             lock (_textLock) { _cursor = _text.Length; if (!shift) _anchor = _cursor; }
+                            UpdateSuggestions();
                             Snapshot();
                         }
                         else if (!ctrl)
                         {
                             HistoryStep(1);
+                            UpdateSuggestions();
                         }
                         break;
 
@@ -595,6 +725,7 @@ internal sealed class KeyboardRouter : IDisposable
                             _cursor = ctrl ? WordBack(_cursor) : Math.Max(_wordStart, _cursor - 1);
                             if (!shift) _anchor = _cursor;
                         }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
@@ -605,6 +736,7 @@ internal sealed class KeyboardRouter : IDisposable
                             _cursor = ctrl ? WordFwd(_cursor) : Math.Min(_text.Length, _cursor + 1);
                             if (!shift) _anchor = _cursor;
                         }
+                        UpdateSuggestions();
                         Snapshot();
                         break;
 
@@ -613,6 +745,7 @@ internal sealed class KeyboardRouter : IDisposable
                         if (ctrl && k.vkCode >= 0x41 && k.vkCode <= 0x5A)
                         {
                             if (full) CtrlLetter(k.vkCode);
+                            UpdateSuggestions();
                             break;
                         }
                         string chars = ToChars(k);
@@ -625,6 +758,7 @@ internal sealed class KeyboardRouter : IDisposable
                                 if (full) { _cursor += chars.Length; _anchor = _cursor; }
                                 else _anchor = _cursor = _text.Length;
                             }
+                            UpdateSuggestions();
                             Snapshot();
                         }
                         break;
@@ -772,7 +906,7 @@ internal sealed class KeyboardRouter : IDisposable
                 short d = (short)(m.mouseData >> 16);
                 _wheelAcc += d;
                 while (_wheelAcc >= 120) { RadialWheelNotches++; _wheelAcc -= 120; }
-                while (_wheelAcc <= -120) { RadialWheelNotches--; _wheelAcc -= 120; }
+                while (_wheelAcc <= -120) { RadialWheelNotches--; _wheelAcc += 120; }
                 Injector.MouseWheel(-d);   // counter-spin so the game's weapon wheel doesn't move
                 return (IntPtr)1;
             }
@@ -957,6 +1091,260 @@ internal sealed class KeyboardRouter : IDisposable
         }
     }
 
+    // ============ typing help ============
+
+    // Recompute the suggestion list for the word at the cursor — or, when the
+    // cursor sits right after a space, next-word predictions. Runs on the hook
+    // thread after every text edit; all lookups are in-memory.
+    void UpdateSuggestions()
+    {
+        _sug.Clear();
+        _sugIndex = -1;
+        _sugActive = false;
+        _sugFragment = "";
+        PendingStart = -1;
+        AddWordHint = null;
+
+        if (!SuggestOn || Mode != Mode.Typing)
+        {
+            PublishSuggestions();
+            return;
+        }
+
+        string prefix, prev1 = "", prev2 = "";
+        bool predicting;
+        lock (_textLock)
+        {
+            Normalize();
+            (int s, int e) = WordBounds();
+            predicting = s == e;
+            // edge punctuation isn't part of the word for suggestions either
+            string raw = predicting ? "" : _text.ToString(s, e - s);
+            int a = 0, b = raw.Length;
+            while (a < b && IsEdgePunct(raw[a])) a++;
+            while (b > a && IsEdgePunct(raw[b - 1])) b--;
+            prefix = raw.Substring(a, b - a).ToLowerInvariant();
+            (prev1, prev2) = ContextBefore(s);
+        }
+
+        if (predicting)
+        {
+            if (PredictOn && prev1.Length > 0)
+                _sug.AddRange(Words.Predict(prev1, prev2, RecentWords()));
+        }
+        else if (prefix.Length > 0)
+        {
+            _sug.AddRange(Words.Complete(prefix, prev1, prev2, RecentWords()));
+            if (_sug.Count == 0 && Words.HasList && !Words.Known(prefix) &&
+                !Expansions.IsDefined(prefix))   // 'brb' is an abbreviation, not a missing word
+                AddWordHint = AddKeyText() + ": add '" + prefix + "'";
+        }
+
+        PublishSuggestions();
+    }
+
+    void PublishSuggestions()
+    {
+        Suggestions = _sug.Count == 0 ? null : _sug.ToArray();
+        SuggestionIndex = _sugActive ? _sugIndex : -1;
+    }
+
+    // the word containing the cursor; empty range when the cursor sits right
+    // after a space (or at the start of the text) — that's the predicting case
+    (int start, int end) WordBounds()
+    {
+        int s = _cursor, e = _cursor;
+        while (s > 0 && _text[s - 1] != ' ') s--;
+        while (e < _text.Length && _text[e] != ' ') e++;
+        return (s, e);
+    }
+
+    // edge punctuation — not part of the word for autocorrect or suggestions
+    static bool IsEdgePunct(char c) =>
+        c is ',' or '.' or ':' or ';' or '!' or '?' or '"' or '\'' or ')'
+           or ']' or '}' or '(' or '[' or '{' or '—' or '–' or '…';
+
+    // the two words before position s (n-gram context); caller holds _textLock
+    (string prev1, string prev2) ContextBefore(int s)
+    {
+        string prev1 = "", prev2 = "";
+        int p = s;
+        for (int w = 0; w < 2; w++)
+        {
+            while (p > 0 && _text[p - 1] == ' ') p--;
+            int ws = p;
+            while (ws > 0 && _text[ws - 1] != ' ') ws--;
+            if (ws == p) break;
+            if (w == 0) prev1 = _text.ToString(ws, p - ws).ToLowerInvariant();
+            else prev2 = _text.ToString(ws, p - ws).ToLowerInvariant();
+            p = ws;
+        }
+        return (prev1, prev2);
+    }
+
+    // unique words of the current message — people reuse words, so candidates
+    // already in the message get a scoring boost
+    string[] RecentWords()
+    {
+        lock (_textLock)
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var w in _text.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                set.Add(w.ToLowerInvariant());
+            return set.ToArray();
+        }
+    }
+
+    // Tab / Shift+Tab: fill the word at the cursor with a suggestion (no
+    // space). With nothing typed — predictions showing right after a space —
+    // Tab INSERTS the predicted word at the cursor; Backspace removes it.
+    void CycleSuggestion(int dir)
+    {
+        if (!SuggestOn || _sug.Count == 0) return;
+        _fixPending = false;
+        lock (_textLock)
+        {
+            Normalize();
+            if (!_sugActive)
+            {
+                (int s, int e) = WordBounds();
+                // empty word = predicting: nothing to replace, the word gets
+                // inserted at the cursor (Backspace then removes it whole)
+                _sugFragment = e <= s ? "" : _text.ToString(s, e - s);
+                _sugIndex = dir > 0 ? 0 : _sug.Count - 1;
+                _sugActive = true;
+            }
+            else
+            {
+                (int s, int e) = WordBounds();
+                string cur = _text.ToString(s, e - s);
+                if (!string.Equals(cur, CaseLike(_sugFragment, _sug[_sugIndex]), StringComparison.Ordinal))
+                    _sugFragment = cur;    // cursor moved to another word — restart from it
+                _sugIndex = (_sugIndex + dir + _sug.Count) % _sug.Count;
+            }
+            ApplySuggestionLocked();
+        }
+        Snapshot();
+        PublishSuggestions();
+    }
+
+    void ApplySuggestionLocked()   // caller holds _textLock
+    {
+        string word = CaseLike(_sugFragment, _sug[_sugIndex]);
+        (int s, int e) = WordBounds();
+        _text.Remove(s, e - s);
+        _text.Insert(s, word);
+        _cursor = _anchor = s + word.Length;
+        PendingStart = s;
+        PendingLen = _sugFragment.Length;
+    }
+
+    // a completion stops being "pending": it stays in the buffer as plain text
+    void FinishSuggestion()
+    {
+        _sugActive = false;
+        _sugIndex = -1;
+        _sugFragment = "";
+        PendingStart = -1;
+    }
+
+    // autocorrect: the word at the cursor is unknown and one candidate is an
+    // obvious fix — replace it, remember the original so an immediate Backspace
+    // reverts. Edge punctuation ("helo,") is stripped first and survives the
+    // replacement; words defined in expansions.txt are left to the expansion
+    // engine; ties are broken by the n-gram context.
+    void CorrectWordAtCursor(bool flash)
+    {
+        if (!CorrectOn) return;
+        lock (_textLock)
+        {
+            Normalize();
+            (int s, int e) = WordBounds();
+            if (e <= s) return;
+            string typed = _text.ToString(s, e - s);
+            int a = 0, b = typed.Length;
+            while (a < b && IsEdgePunct(typed[a])) a++;
+            while (b > a && IsEdgePunct(typed[b - 1])) b--;
+            string core = typed.Substring(a, b - a);
+            if (core.Length < 2) return;
+            if (core.ToLowerInvariant() == _rejected) return;   // user reverted this word
+            if (Expansions.IsDefined(core)) return;             // "brb" etc. — the expansion owns it
+
+            var (prev1, prev2) = ContextBefore(s);
+            string? fix = Words.Correct(core, prev1, prev2);
+            if (fix == null) return;
+            fix = CaseLike(core, fix);
+            int ws = s + a;                       // where the word core starts
+            _text.Remove(ws, b - a);
+            _text.Insert(ws, fix);
+            _cursor = _anchor = ws + fix.Length + (typed.Length - b);
+            _fixStart = ws;
+            _fixLen = fix.Length;
+            _fixTyped = core;
+            _fixWord = fix;
+            _fixPending = true;
+            if (flash)
+            {
+                CorrectionStart = ws;
+                CorrectionLen = fix.Length;
+                CorrectionTime = Environment.TickCount;
+            }
+        }
+        Snapshot();
+    }
+
+    // stream-mode submit: autocorrect first, then speak the word
+    void SubmitWordCorrected()
+    {
+        CorrectWordAtCursor(true);
+        SubmitWord();
+    }
+
+    // the add-word bind: the word at the cursor joins the dictionary (edge
+    // punctuation stripped, so "jorge," adds "jorge")
+    void AddCurrentWord()
+    {
+        lock (_textLock)
+        {
+            Normalize();
+            (int s, int e) = WordBounds();
+            if (e <= s) return;
+            string word = _text.ToString(s, e - s);
+            int a = 0, b = word.Length;
+            while (a < b && IsEdgePunct(word[a])) a++;
+            while (b > a && IsEdgePunct(word[b - 1])) b--;
+            if (b - a < 1) return;
+            Words.AddWord(word.Substring(a, b - a).ToLowerInvariant());
+        }
+        Log.Enqueue("word added to dictionary");
+        UpdateSuggestions();
+    }
+
+    string AddKeyText()
+    {
+        var parts = new List<string>();
+        if (BindAddWordCtrl) parts.Add("Ctrl");
+        if (BindAddWordAlt) parts.Add("Alt");
+        if (BindAddWordShift) parts.Add("Shift");
+        parts.Add(BindAddWordVk == 0 ? "none" : ((Keys)BindAddWordVk).ToString());
+        return string.Join("+", parts);
+    }
+
+    // match the fragment's capitalization: a fully-uppercase fragment — even a
+    // single letter — makes the whole word uppercase (so completions still
+    // shout), mixed case gets a leading cap, otherwise lowercase
+    static string CaseLike(string fragment, string word)
+    {
+        if (fragment.Length == 0 || word.Length == 0) return word;
+        bool firstUpper = char.IsUpper(fragment[0]);
+        bool restUpper = true;
+        for (int i = 1; i < fragment.Length; i++)
+            if (char.IsLower(fragment[i])) { restUpper = false; break; }
+        if (firstUpper && restUpper) return word.ToUpperInvariant();
+        if (firstUpper) return char.ToUpperInvariant(word[0]) + word[1..];
+        return word;
+    }
+
     // ============ message history ============
 
     // Up/Down cycle through previously sent messages. The live draft (including
@@ -1073,6 +1461,7 @@ internal sealed class KeyboardRouter : IDisposable
             Mode = Mode.Typing;
             PinnedPreview = string.Join(",", _pinned.Select(v => ((Keys)v).ToString()));
             Snapshot();
+            UpdateSuggestions();
             Log.Enqueue("TYPING ON — pinned keys: " + PinnedPreview);
         }
         else

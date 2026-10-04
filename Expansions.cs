@@ -19,9 +19,16 @@ internal static class Expansions
 {
     sealed class Entry { public string Expansion = ""; public string? Tag; public bool VoiceTag; }
 
-    static readonly Dictionary<string, List<Entry>> _map = new();
+    static Dictionary<string, List<Entry>> _map = new();   // swapped atomically on reload
     static DateTime _stamp;
     static int _count;
+
+    // does this exact abbreviation exist? (autocorrect must not "fix" 'brb')
+    public static bool IsDefined(string abbr)
+    {
+        EnsureLoaded();
+        return _map.ContainsKey(abbr.ToLowerInvariant());
+    }
 
     public static string FilePath => Path.Combine(AppData.Folder, "expansions.txt");
     static string OldFilePath => Path.Combine(AppData.Folder, "abbreviations.txt");
@@ -111,7 +118,10 @@ internal static class Expansions
             if (fi.LastWriteTime == _stamp) return;
             _stamp = fi.LastWriteTime;
 
-            _map.Clear(); _count = 0;
+            // build-then-swap: readers on other threads (the TTS threads, the
+            // hook thread) always see a fully-built map, never a half-cleared one
+            var fresh = new Dictionary<string, List<Entry>>();
+            int count = 0;
             foreach (var raw in File.ReadAllLines(fi.FullName))
             {
                 string line = raw.Trim();
@@ -135,10 +145,12 @@ internal static class Expansions
                 }
                 if (abbr.Length == 0 || expansion.Length == 0) continue;
 
-                if (!_map.TryGetValue(abbr, out var list)) _map[abbr] = list = new List<Entry>();
+                if (!fresh.TryGetValue(abbr, out var list)) fresh[abbr] = list = new List<Entry>();
                 list.Add(new Entry { Expansion = expansion, Tag = tag, VoiceTag = voiceTag });
-                _count++;
+                count++;
             }
+            _map = fresh;
+            _count = count;
         }
         catch (Exception ex)
         {

@@ -15,6 +15,7 @@ internal interface ITts
 {
     string[] Voices { get; }
     WaveFormat Format { get; }
+    string Language { get; }               // e.g. "en-us" — picks the dictionary
     Action<byte[]>? OnSamples { get; set; }     // trimmed MONO PCM at the render rate
     void SetVoice(string name);
     void SetRate(int rate);
@@ -251,12 +252,14 @@ internal sealed class SapiTts : ITts
     int _shoutPct = 15;
     int _renderRate = 48000;
     string _voice = "";
+    volatile string _lang = "";            // active voice culture, for the dictionary
 
     double ShoutGain => 1.0 + _shoutPct * 0.03;   // shout slider also drives loudness
 
     public WaveFormat Format { get; private set; } = new WaveFormat(48000, 16, 1);
     public Action<byte[]>? OnSamples { get; set; }
     public string[] Voices => _voices;
+    public string Language => _lang;
 
     public SapiTts()
     {
@@ -286,6 +289,7 @@ internal sealed class SapiTts : ITts
                         Render(" ");
                         _voices = _synth.GetInstalledVoices()
                             .Where(v => v.Enabled).Select(v => v.VoiceInfo.Name).ToArray();
+                        _lang = _synth.Voice?.Culture?.Name ?? "";
                         Log.Enqueue($"SAPI ready — {Format}, {_voices.Length} voices installed");
                         _ready.Set();
                         break;
@@ -340,6 +344,7 @@ internal sealed class SapiTts : ITts
                         {
                             _voice = c.Text;
                             _synth.SelectVoice(c.Text);
+                            _lang = _synth.Voice?.Culture?.Name ?? "";
                             _cache.Clear();
                             Log.Enqueue("SAPI voice -> " + c.Text);
                         }

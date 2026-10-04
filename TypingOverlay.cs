@@ -8,6 +8,9 @@ internal sealed class TypingOverlay : Form
     readonly System.Windows.Forms.Timer _timer = new() { Interval = 16 };
     int _topTick;
 
+    const int BandHeight = 48;    // the text line, at the bottom of the window
+    const int PopupRoom = 80;     // transparent room above it for the suggestion popup
+
     static readonly Font TagFont = new("Consolas", 8.5f);
 
     const TextFormatFlags Tf =
@@ -22,13 +25,17 @@ internal sealed class TypingOverlay : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         Opacity = 0.85;
+        // everything not explicitly painted is see-through; the band and the
+        // suggestion popup are painted islands floating over the game
+        TransparencyKey = Color.FromArgb(255, 1, 0, 1);
+        BackColor = TransparencyKey;
         Font = new Font("Consolas", 14f);
 
         var b = Screen.PrimaryScreen!.Bounds;
         Width = Math.Min(880, b.Width - 60);
-        Height = 48;
+        Height = BandHeight + PopupRoom;
         Left = b.Left + (b.Width - Width) / 2;
-        Top = b.Top + (int)(b.Height * 0.74);
+        Top = b.Top + (int)(b.Height * 0.74) - PopupRoom;   // band stays at the old position
 
         _timer.Tick += (s, e) => Tick();
         _timer.Start();
@@ -65,7 +72,6 @@ internal sealed class TypingOverlay : Form
     {
         base.OnPaint(e);
         var g = e.Graphics;
-        BackColor = Theme.Bg;
 
         string full = _r.TypedText, unsp = _r.UnspokenText;
         int spokenLen = Math.Max(0, full.Length - unsp.Length);
@@ -98,23 +104,40 @@ internal sealed class TypingOverlay : Form
             blockIsCaret = true;
         }
 
+        // pending Tab completion: the fragment is the user's text, the appended
+        // letters came from the suggestion
+        string? pendSuf = null;
+        if (!hasSel && _r.PendingStart >= 0 && _r.SuggestionIndex >= 0)
+        {
+            int split = Math.Clamp(_r.PendingStart + _r.PendingLen - spokenLen, 0, wcur);
+            if (split < wcur)
+            {
+                pendSuf = pre[split..];
+                pre = pre[..split];
+            }
+        }
+
         int W(string s) => s.Length == 0 ? 0 :
             TextRenderer.MeasureText(g, s, Font, new Size(int.MaxValue, int.MaxValue), Tf).Width;
 
-        int y = Math.Max(0, (ClientSize.Height - Font.Height) / 2);
+        var sugs = _r.Suggestions;
+        bool popup = (sugs != null && sugs.Length > 0) || _r.AddWordHint != null;
+
+        // the text band
+        int bandY = PopupRoom;
+        using (var fill = new SolidBrush(Theme.Bg))
+            g.FillRectangle(fill, 0, bandY, Width, BandHeight);
+        int y = bandY + Math.Max(0, (BandHeight - Font.Height) / 2);
         int x = 10;
 
-        // mode indicator: the theme's PNG (stream mode = spoken-text tint, the
-        // gray of words already spoken; full mode = live-text tint) or the
-        // classic text tag. Drawn centered on the overlay — Tint already
-        // cropped the artwork to its own bounds, so this centers the logo
-        // itself, not the canvas it was exported on.
+        // mode indicator: the theme's PNG (stream = spoken tint, full = live
+        // tint) or the text tag in the same two colors
         if (Theme.IndicatorStream != null && Theme.IndicatorFull != null)
         {
             var img = _r.StreamWords ? Theme.IndicatorStream : Theme.IndicatorFull;
             int ih = Font.Height + 4;
             int iw = (int)Math.Round((double)img.Width * ih / img.Height);
-            int iy = Math.Max(0, (ClientSize.Height - ih) / 2);
+            int iy = bandY + Math.Max(0, (BandHeight - ih) / 2);
             g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
             g.DrawImage(img, x, iy, iw, ih);
             x += iw + 12;
@@ -122,27 +145,54 @@ internal sealed class TypingOverlay : Form
         else
         {
             string tag = _r.StreamWords ? "stream" : "full";
-            Color tagColor = _r.StreamWords ? Theme.TagStream : Theme.TagFull;
+            Color tagColor = _r.StreamWords ? Theme.Spoken : Theme.Text;
             int tagW = TextRenderer.MeasureText(g, tag, TagFont, new Size(int.MaxValue, int.MaxValue), Tf).Width;
             TextRenderer.DrawText(g, tag, TagFont,
                 new Rectangle(x, y + 5, tagW + 4, Font.Height), tagColor, Tf);
             x += tagW + 12;
         }
 
+        // autocorrect flash: the corrected word lights up and fades (~350ms)
+        if (_r.CorrectionStart >= 0)
+        {
+            int age = Environment.TickCount - _r.CorrectionTime;
+            if (age >= 0 && age < 350)
+            {
+                int cs = Math.Clamp(_r.CorrectionStart, 0, full.Length);
+                int cl = Math.Min(_r.CorrectionLen, full.Length - cs);
+                if (cl > 0)
+                {
+                    int alpha = 255 - age * 255 / 350;
+                    using var flash = new SolidBrush(Color.FromArgb(alpha, Theme.SelBg));
+                    g.FillRectangle(flash, x + W(full[..cs]), y, W(full.Substring(cs, cl)), Font.Height);
+                }
+            }
+        }
+
+        int total = W(gray) + W(pre) + (pendSuf != null ? W(pendSuf) : 0) + W(block) + W(rest);
         int avail = ClientSize.Width - x - 90;
-        int total = W(gray) + W(pre) + W(block) + W(rest);
         if (total > avail && gray.Length + pre.Length + (blockIsCaret ? 0 : block.Length) + rest.Length > 1)
         {
             int cell = Math.Max(4, W(new string('M', 10)) / 10);
             int over = (total - avail + cell - 1) / cell;
             over = TrimLeft(ref gray, over);
             over = TrimLeft(ref pre, over);
+            if (pendSuf != null) over = TrimLeft(ref pendSuf, over);
             if (!blockIsCaret) over = TrimLeft(ref block, over);
             TrimLeft(ref rest, over);
         }
 
         x = DrawSeg(g, gray, Theme.Spoken, null, x, y);
         x = DrawSeg(g, pre, Theme.Text, null, x, y);
+        if (pendSuf != null)
+        {
+            // underline the appended letters — a shape, not a color, so it reads
+            // in every theme (grayscale themes stay grayscale)
+            using (var fill = new SolidBrush(Theme.Text))
+                g.FillRectangle(fill, x, y + Font.Height - 2, W(pendSuf), 2);
+            x = DrawSeg(g, pendSuf, Theme.Text, null, x, y);
+        }
+        int caretX = x;
 
         if (blockIsCaret)
         {
@@ -161,12 +211,70 @@ internal sealed class TypingOverlay : Form
 
         DrawSeg(g, rest, Theme.Text, null, x, y);
 
+        // scanlines — CLIPPED to the band; lines over the transparent area
+        // would become visible pixels
         if (Theme.Scanlines)
         {
             using var pen = new Pen(Color.FromArgb(80, 0, 0, 0), 1);
-            for (int sy = 0; sy < Height; sy += 3)
+            for (int sy = bandY; sy < Height; sy += 3)
                 g.DrawLine(pen, 0, sy, Width, sy);
         }
+
+        // the suggestion popup, floating above the band at the caret
+        if (popup) DrawPopup(g, sugs, _r.AddWordHint, caretX);
+    }
+
+    // a small bordered box above the text band, horizontally at the caret —
+    // Minecraft / IntelliSense style. Selected entry (Tab pending) highlighted.
+    void DrawPopup(Graphics g, string[]? sugs, string? hint, int caretX)
+    {
+        const int RowH = 18;
+
+        int rows, w = 70;
+        string[] items;
+        if (sugs != null && sugs.Length > 0)
+        {
+            items = sugs;
+            rows = sugs.Length;
+            foreach (var s in sugs)
+                w = Math.Max(w, TextRenderer.MeasureText(g, s, TagFont,
+                    new Size(int.MaxValue, int.MaxValue), Tf).Width + 18);
+        }
+        else
+        {
+            items = Array.Empty<string>();
+            rows = 1;
+            if (hint != null)
+                w = Math.Max(w, TextRenderer.MeasureText(g, hint, TagFont,
+                    new Size(int.MaxValue, int.MaxValue), Tf).Width + 18);
+        }
+        w = Math.Min(w, ClientSize.Width - 16);
+
+        int h = rows * RowH + 4;
+        int maxX = Math.Max(8, ClientSize.Width - w - 8);
+        int x = Math.Clamp(caretX - 6, 8, maxX);
+        int top = PopupRoom - h - 6;
+
+        using (var fill = new SolidBrush(Theme.Bg))
+            g.FillRectangle(fill, x, top, w, h);
+        using (var pen = new Pen(Theme.Spoken, 1f))
+            g.DrawRectangle(pen, x + 0.5f, top + 0.5f, w - 1, h - 1);
+
+        for (int i = 0; i < items.Length; i++)
+        {
+            int ry = top + 2 + i * RowH;
+            if (i == _r.SuggestionIndex)
+            {
+                using var sel = new SolidBrush(Theme.SelBg);
+                g.FillRectangle(sel, x + 2, ry, w - 4, RowH - 1);
+            }
+            TextRenderer.DrawText(g, items[i], TagFont,
+                new Rectangle(x + 8, ry + 2, w - 12, RowH - 2),
+                i == _r.SuggestionIndex ? Theme.Text : Theme.Spoken, Tf);
+        }
+        if (items.Length == 0 && hint != null)
+            TextRenderer.DrawText(g, hint, TagFont,
+                new Rectangle(x + 8, top + 3, w - 12, RowH - 2), Theme.Spoken, Tf);
     }
 
     int DrawSeg(Graphics g, string s, Color fg, Color? bg, int x, int y)
