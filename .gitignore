@@ -3,4 +3,4 @@ obj/
 .vs/
 piper/
 crash.txt
-*.user
+*.usergit

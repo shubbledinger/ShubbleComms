@@ -12,7 +12,8 @@ builds, bundles third-party components with their own licenses:
 - GLaDOS voice model — by dnhkng, MIT.
   https://github.com/dnhkng/GLaDOS
   https://huggingface.co/rokeya71/VITS-Piper-GlaDOS-en-onnx
-  Trained on Portal voice lines. (c) Valve Corporation. Included
-  non-commercially as fan content.
+  Trained on Portal voice lines. (c) Valve Corporation. The Aperture
+  Science logo shipped as the Portal theme's indicator is likewise
+  Valve's. Both included non-commercially as fan content.
 
 Individual license texts ship in the licenses\ folder of the release archive.

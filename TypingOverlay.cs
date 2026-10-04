@@ -104,12 +104,30 @@ internal sealed class TypingOverlay : Form
         int y = Math.Max(0, (ClientSize.Height - Font.Height) / 2);
         int x = 10;
 
-        // mode tag — the Alt+E indicator, theme-colored
-        string tag = _r.StreamWords ? "stream" : "full";
-        int tagW = TextRenderer.MeasureText(g, tag, TagFont, new Size(int.MaxValue, int.MaxValue), Tf).Width;
-        TextRenderer.DrawText(g, tag, TagFont,
-            new Rectangle(x, y + 5, tagW + 4, Font.Height), Theme.Spoken, Tf);
-        x += tagW + 12;
+        // mode indicator: the theme's PNG (stream mode = spoken-text tint, the
+        // gray of words already spoken; full mode = live-text tint) or the
+        // classic text tag. Drawn centered on the overlay — Tint already
+        // cropped the artwork to its own bounds, so this centers the logo
+        // itself, not the canvas it was exported on.
+        if (Theme.IndicatorStream != null && Theme.IndicatorFull != null)
+        {
+            var img = _r.StreamWords ? Theme.IndicatorStream : Theme.IndicatorFull;
+            int ih = Font.Height + 4;
+            int iw = (int)Math.Round((double)img.Width * ih / img.Height);
+            int iy = Math.Max(0, (ClientSize.Height - ih) / 2);
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.DrawImage(img, x, iy, iw, ih);
+            x += iw + 12;
+        }
+        else
+        {
+            string tag = _r.StreamWords ? "stream" : "full";
+            Color tagColor = _r.StreamWords ? Theme.TagStream : Theme.TagFull;
+            int tagW = TextRenderer.MeasureText(g, tag, TagFont, new Size(int.MaxValue, int.MaxValue), Tf).Width;
+            TextRenderer.DrawText(g, tag, TagFont,
+                new Rectangle(x, y + 5, tagW + 4, Font.Height), tagColor, Tf);
+            x += tagW + 12;
+        }
 
         int avail = ClientSize.Width - x - 90;
         int total = W(gray) + W(pre) + W(block) + W(rest);

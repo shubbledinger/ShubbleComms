@@ -12,7 +12,7 @@ using NAudio.CoreAudioApi;
 internal static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         Application.ThreadException += (s, e) => Crash(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (s, e) => Crash((Exception)e.ExceptionObject);
@@ -44,8 +44,8 @@ internal static class Program
     }
 }
 
-// Where the user's files live (settings.json, abbreviations.txt, soundboard.txt).
-// Migrates the old CommsSpike folder once so nothing is lost to the rename.
+// Where the user's files live (settings.json, expansions.txt, soundboard.txt,
+// history.json). Migrates the old CommsSpike folder once so nothing is lost.
 internal static class AppData
 {
     public static string Folder { get; } = Init();
@@ -60,7 +60,7 @@ internal static class AppData
             if (!File.Exists(Path.Combine(newPath, "settings.json")) && Directory.Exists(oldPath))
             {
                 Directory.CreateDirectory(newPath);
-                foreach (string name in new[] { "settings.json", "abbreviations.txt", "soundboard.txt" })
+                foreach (string name in new[] { "settings.json", "abbreviations.txt", "expansions.txt", "soundboard.txt", "history.json" })
                 {
                     string src = Path.Combine(oldPath, name);
                     if (File.Exists(src)) File.Copy(src, Path.Combine(newPath, name), true);
@@ -127,16 +127,6 @@ internal sealed class SettingsForm : Form
     string? _recSlot;
     long _recArm;
 
-    // status strip — reflects what the keyboard hooks are currently doing
-    readonly Label _status = new()
-    {
-        Dock = DockStyle.Top,
-        Height = 28,
-        TextAlign = ContentAlignment.MiddleCenter,
-        Font = new Font("Consolas", 11f, FontStyle.Bold),
-        ForeColor = Color.White
-    };
-
     readonly ComboBox _voice = new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList,
@@ -175,7 +165,7 @@ internal sealed class SettingsForm : Form
     readonly CheckedListBox _outputs = new()
     {
         CheckOnClick = true,
-        Width = 470,
+        Width = 560,
         Height = 88,
         BackColor = Color.FromArgb(30, 30, 30),
         ForeColor = Color.White,
@@ -201,10 +191,9 @@ internal sealed class SettingsForm : Form
     List<MMDevice> _devices = new();
     bool _populating;
     Settings _settings = new();
-    Mode _lastMode = (Mode)(-1);
-    bool _lastStream = true;
 
     static string SettingsPath => Path.Combine(AppData.Folder, "settings.json");
+    static string HistoryPath => Path.Combine(AppData.Folder, "history.json");
 
     public SettingsForm(KeyboardRouter router, ITts tts, AudioOut audio)
     {
@@ -221,7 +210,8 @@ internal sealed class SettingsForm : Form
         Text = "ShubbleComms";
         Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
         StartPosition = FormStartPosition.CenterScreen;
-        Width = 600; Height = 580;
+        StartPosition = FormStartPosition.CenterScreen;
+        Width = 780; Height = 740;
         BackColor = Color.FromArgb(24, 24, 24);
         Font = new Font("Segoe UI", 9f);
 
@@ -232,6 +222,17 @@ internal sealed class SettingsForm : Form
                 _settings = JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath)) ?? new Settings();
         }
         catch (Exception ex) { Log.Enqueue("settings load failed: " + ex.Message); }
+
+        // sent-message history (Up/Down in typing mode cycles through it)
+        try
+        {
+            if (File.Exists(HistoryPath))
+            {
+                var messages = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(HistoryPath));
+                if (messages != null) _router.LoadHistory(messages);
+            }
+        }
+        catch (Exception ex) { Log.Enqueue("history load failed: " + ex.Message); }
 
         // sections stack top-to-bottom; the panel scrolls if the window is small
         var stack = new TableLayoutPanel
@@ -250,7 +251,6 @@ internal sealed class SettingsForm : Form
         stack.Controls.Add(ThemeGroup());
 
         Controls.Add(stack);
-        Controls.Add(_status);
 
         _loading = true;
 
@@ -283,9 +283,10 @@ internal sealed class SettingsForm : Form
         _tier1.Checked = _settings.Tier1;
         _radialToggle.Checked = _settings.RadialToggle;
 
+        Theme.Init();
         foreach (string n in Theme.Names) _theme.Items.Add(n);
         _theme.SelectedIndexChanged += (s, e) => { Theme.Apply((string)_theme.SelectedItem!); Save(); };
-        string themeName = Theme.Names.Contains(_settings.Theme) ? _settings.Theme : "Dark";
+        string themeName = Theme.Names.Contains(_settings.Theme) ? _settings.Theme : Theme.Names[0];
         _theme.SelectedItem = themeName;
         Theme.Apply(themeName);
 
@@ -440,19 +441,27 @@ internal sealed class SettingsForm : Form
     {
         return Group("Key binds",
             Row(Lbl("typing"), _typingBind, Lbl("stream"), _streamBind, Lbl("radial"), _radialBind),
-            Row(_radialToggle, Hint("click to re-record · middle/right-click to clear")));
+            Row(_radialToggle, Hint("click to re-record · middle/right-click to clear · extra held modifiers are ignored")));
     }
 
     GroupBox TypingGroup()
     {
-        return Group("Typing mode", Row(_streamWords, _releaseKeys, _tier1));
+        return Group("Typing mode",
+            Row(_streamWords, _releaseKeys, _tier1),
+            Row(
+                MkButton("clear message history", () =>
+                {
+                    _router.ClearHistory();
+                    try { File.Delete(HistoryPath); } catch { }
+                }),
+                Hint("Up/Down while typing cycles previously sent messages")));
     }
 
     GroupBox FilesGroup()
     {
         return Group("Files",
             Row(
-                MkButton("edit abbreviations", () => OpenFile(Abbrev.FilePath)),
+                MkButton("edit expansions", () => OpenFile(Expansions.FilePath)),
                 MkButton("edit soundboard", () => OpenFile(RadialOverlay.BoardPath)),
                 MkButton("open config folder", () => OpenFolder(AppData.Folder))));
     }
@@ -614,6 +623,17 @@ Everything runs locally. Nothing is uploaded anywhere, ever.
         Save();
     }
 
+    void SaveHistory()
+    {
+        try
+        {
+            Directory.CreateDirectory(AppData.Folder);
+            File.WriteAllText(HistoryPath,
+                JsonSerializer.Serialize(_router.HistorySnapshot()));
+        }
+        catch (Exception ex) { Log.Enqueue("history save failed: " + ex.Message); }
+    }
+
     void Save()
     {
         if (_loading) return;
@@ -662,6 +682,7 @@ Everything runs locally. Nothing is uploaded anywhere, ever.
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         Save();
+        SaveHistory();
         // X / Alt+F4 / Windows shutdown → real quit. Tray Quit sets _exiting itself.
         if (e.CloseReason == CloseReason.UserClosing || e.CloseReason == CloseReason.WindowsShutDown)
             _exiting = true;
@@ -766,21 +787,11 @@ Everything runs locally. Nothing is uploaded anywhere, ever.
             Log.Enqueue("bind recording timed out");
         }
 
-        if (_lastMode != _router.Mode || _lastStream != _router.StreamWords)
+        // persist the message history whenever the hook thread changed it
+        if (_router.HistDirty)
         {
-            _lastMode = _router.Mode;
-            _lastStream = _router.StreamWords;
-            if (_router.Mode == Mode.Typing)
-            {
-                _status.Text = _router.StreamWords ? "TYPING — stream mode" : "TYPING — full message mode";
-                _status.BackColor = Theme.SelBg;
-            }
-            else
-            {
-                _status.Text = "GAME MODE";
-                _status.BackColor = Theme.RadCenter;
-            }
-            _status.ForeColor = Color.White;
+            _router.HistDirty = false;
+            SaveHistory();
         }
     }
 }

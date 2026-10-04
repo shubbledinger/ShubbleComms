@@ -295,45 +295,45 @@ internal sealed class SapiTts : ITts
                     // exactly the segments it will later fire
                     case "say":
                     case "preload":
-                    {
-                        var segs = Pcm.Segment(c.Text);
-                        if (segs.Count == 0) break;
-
-                        var parts = new List<byte[]>();
-                        foreach (var (seg, shout) in segs)
                         {
-                            // the abbreviation dictionary lives here: speech-side,
-                            // invisible to the display. Shout detection ran on the TYPED
-                            // segment, so "WTF" still shouts after expanding to lowercase
-                            string say = Abbrev.Expand(seg,
-                                _synth.Voice?.Culture?.Name ?? "",
-                                _synth.Voice?.Name ?? "");
-                            if (say.Length == 0) continue;
+                            var segs = Pcm.Segment(c.Text);
+                            if (segs.Count == 0) break;
 
-                            string key = (shout ? "!" : "") + say;
-                            if (!_cache.TryGetValue(key, out var pcm))
+                            var parts = new List<byte[]>();
+                            foreach (var (seg, shout) in segs)
                             {
-                                pcm = Render(say);
-                                // pitch is pure DSP (engine SSML support is inconsistent
-                                // across SAPI voices); shout is pitch + volume only —
-                                // no speed change
-                                int pitchPct = _pitchPct + (shout ? _shoutPct : 0);
-                                if (pitchPct != 0 && pcm.Length > 0)
-                                    pcm = Pcm.PitchShiftSpeed(pcm, _renderRate, _renderRate,
-                                        1.0 + pitchPct / 100.0, 1.0);
-                                if (shout && pcm.Length > 0) pcm = Pcm.Boost(pcm, ShoutGain);
-                                _cache[key] = pcm;
-                            }
-                            if (pcm.Length > 0) parts.Add(pcm);
-                        }
-                        if (parts.Count == 0) break;
+                                // the abbreviation dictionary lives here: speech-side,
+                                // invisible to the display. Shout detection ran on the TYPED
+                                // segment, so "WTF" still shouts after expanding to lowercase
+                                string say = Expansions.Expand(seg,
+                                    _synth.Voice?.Culture?.Name ?? "",
+                                    _synth.Voice?.Name ?? "");
+                                if (say.Length == 0) continue;
 
-                        // mixed caps = multiple segments: small pause at each
-                        // voice-character switch
-                        byte[] all = Pcm.Join(parts, (int)(_renderRate * 0.06));
-                        if (c.Kind == "say") OnSamples?.Invoke(all);
-                        break;
-                    }
+                                string key = (shout ? "!" : "") + say;
+                                if (!_cache.TryGetValue(key, out var pcm))
+                                {
+                                    pcm = Render(say);
+                                    // pitch is pure DSP (engine SSML support is inconsistent
+                                    // across SAPI voices); shout is pitch + volume only —
+                                    // no speed change
+                                    int pitchPct = _pitchPct + (shout ? _shoutPct : 0);
+                                    if (pitchPct != 0 && pcm.Length > 0)
+                                        pcm = Pcm.PitchShiftSpeed(pcm, _renderRate, _renderRate,
+                                            1.0 + pitchPct / 100.0, 1.0);
+                                    if (shout && pcm.Length > 0) pcm = Pcm.Boost(pcm, ShoutGain);
+                                    _cache[key] = pcm;
+                                }
+                                if (pcm.Length > 0) parts.Add(pcm);
+                            }
+                            if (parts.Count == 0) break;
+
+                            // mixed caps = multiple segments: small pause at each
+                            // voice-character switch
+                            byte[] all = Pcm.Join(parts, (int)(_renderRate * 0.06));
+                            if (c.Kind == "say") OnSamples?.Invoke(all);
+                            break;
+                        }
 
                     case "voice":
                         if (_voice != c.Text)

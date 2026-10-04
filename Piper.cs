@@ -36,6 +36,7 @@ internal sealed class PiperTts : ITts
     string[] _voices = Array.Empty<string>();
     string _model = "", _modelName = "";
     int _modelRate = 22050;
+    string _modelLang = "";   // e.g. "en-us" — from the model config, for #lang abbreviations
     int _rate = 4;
     int _pitchPct;
     int _shoutPct = 15;
@@ -186,13 +187,13 @@ internal sealed class PiperTts : ITts
                 {
                     _modelName = c.Text;
                     _model = ResolveModel(c.Text);
-                    _modelRate = ReadModelRate(_model);
+                    (_modelRate, _modelLang) = ReadModelInfo(_model);
                     _cache.Clear();
                     _proc?.Dispose();
                     _proc = null;
                     _warmed = false;
                     _saysFailed = 0;
-                    Log.Enqueue($"piper voice -> {c.Text} ({_modelRate}Hz)");
+                    Log.Enqueue($"piper voice -> {c.Text} ({_modelRate}Hz, {_modelLang})");
                     // pay the model load NOW, in the background — not on the first word
                     if (_mode != PiperMode.PerUtterance) EnsureWarmed();
                 }
@@ -228,7 +229,7 @@ internal sealed class PiperTts : ITts
                     var parts = new List<byte[]>();
                     foreach (var (seg, shout) in segs)
                     {
-                        string say = Abbrev.Expand(seg, ModelLang(), _modelName);
+                        string say = Expansions.Expand(seg, _modelLang, _modelName);
                         if (say.Length == 0) continue;
                         string key = (shout ? "!" : "") + say;
                         if (!_cache.TryGetValue(key, out var pcm))
@@ -477,8 +478,13 @@ internal sealed class PiperTts : ITts
         return ms.ToArray();   // int16 mono @ model rate
     }
 
-    static int ReadModelRate(string model)
+    // Sample rate and language from the model's .onnx.json: audio.sample_rate
+    // and espeak.voice (e.g. "en-us"). Language falls back to the filename
+    // prefix ("en_US-lessac-medium.onnx" -> "en-US"), then to unknown.
+    static (int rate, string lang) ReadModelInfo(string model)
     {
+        int rate = 22050;   // the common default
+        string lang = "";
         try
         {
             string cfg = model + ".json";
@@ -487,18 +493,22 @@ internal sealed class PiperTts : ITts
                 using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
                 if (doc.RootElement.TryGetProperty("audio", out var audio) &&
                     audio.TryGetProperty("sample_rate", out var sr))
-                    return sr.GetInt32();
+                    rate = sr.GetInt32();
+                if (doc.RootElement.TryGetProperty("espeak", out var espeak) &&
+                    espeak.TryGetProperty("voice", out var v) &&
+                    v.ValueKind == JsonValueKind.String)
+                    lang = v.GetString() ?? "";
             }
         }
         catch { }
-        return 22050;   // the common default
-    }
 
-    // "en_US-glados-medium.onnx" -> "en-US" (for the abbreviation language tags)
-    string ModelLang()
-    {
-        int dash = _modelName.IndexOf('-');
-        return dash <= 0 ? "" : _modelName[..dash].Replace('_', '-');
+        if (lang.Length == 0)
+        {
+            string name = Path.GetFileNameWithoutExtension(model);
+            int dash = name.IndexOf('-');
+            if (dash > 0) lang = name[..dash].Replace('_', '-');
+        }
+        return (rate, lang);
     }
 }
 

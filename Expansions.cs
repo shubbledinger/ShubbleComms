@@ -3,16 +3,19 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
 
-// Abbreviation dictionary, applied speech-side only (the display always shows
+// Expansion dictionary, applied speech-side only (the display always shows
 // what was typed). Entries:
 //   abbr -> expansion          (every voice)
-//   abbr -> expansion #en      (voices whose culture starts with "en", e.g. en-US)
+//   abbr -> expansion #en      (voices whose language starts with "en", e.g. en-us)
 //   abbr -> expansion @glados  (voices whose NAME contains "glados" — the piper
 //                               model file glados.onnx matches; SAPI names match
 //                               too, e.g. @zira)
 // Longest abbreviation wins; it must not be flanked by letters inside a word;
-// one replacement per word. The file auto-reloads the moment you save it.
-internal static class Abbrev
+// one replacement per word. When several entries match equally, the most
+// specific tag wins: @voice over #lang over no tag. A voice whose language
+// can't be determined gets untagged and @voice entries only.
+// The file auto-reloads the moment you save it.
+internal static class Expansions
 {
     sealed class Entry { public string Expansion = ""; public string? Tag; public bool VoiceTag; }
 
@@ -20,7 +23,8 @@ internal static class Abbrev
     static DateTime _stamp;
     static int _count;
 
-    public static string FilePath => Path.Combine(AppData.Folder, "abbreviations.txt");
+    public static string FilePath => Path.Combine(AppData.Folder, "expansions.txt");
+    static string OldFilePath => Path.Combine(AppData.Folder, "abbreviations.txt");
 
     public static string Expand(string text, string voiceLang, string voiceName)
     {
@@ -48,7 +52,16 @@ internal static class Abbrev
                 idx = lower.IndexOf(abbr, idx + 1, StringComparison.Ordinal);
             }
         }
-        hits.Sort((x, y) => x.len != y.len ? y.len - x.len : x.pos - y.pos);
+        // longest abbreviation first, then earliest in the word, then most
+        // specific tag — @voice beats #lang beats untagged
+        hits.Sort((x, y) =>
+        {
+            int c = y.len - x.len;
+            if (c != 0) return c;
+            c = x.pos - y.pos;
+            if (c != 0) return c;
+            return Rank(y.e) - Rank(x.e);
+        });
 
         foreach (var h in hits)
         {
@@ -62,8 +75,9 @@ internal static class Abbrev
         return word;
     }
 
-    // no tag = all voices. "#xx" = language prefix match (unknown voice expands
-    // all). "@xx" = voice NAME contains xx.
+    // no tag = all voices. "#xx" = language prefix match. "@xx" = voice NAME
+    // contains xx. A voice whose language can't be determined matches NO
+    // language-tagged entries.
     static bool TagMatches(Entry e, string voiceLang, string voiceName)
     {
         if (string.IsNullOrEmpty(e.Tag)) return true;
@@ -72,10 +86,13 @@ internal static class Abbrev
             return !string.IsNullOrEmpty(voiceName) &&
                    voiceName.ToLowerInvariant().Contains(e.Tag, StringComparison.Ordinal);
         }
-        if (string.IsNullOrEmpty(voiceLang)) return true;
+        if (string.IsNullOrEmpty(voiceLang)) return false;
         string v = voiceLang.ToLowerInvariant();
         return v.StartsWith(e.Tag, StringComparison.Ordinal) || e.Tag.StartsWith(v, StringComparison.Ordinal);
     }
+
+    // entry specificity for tie-breaking: @voice (3) > #lang (2) > untagged (1)
+    static int Rank(Entry e) => e.VoiceTag ? 3 : string.IsNullOrEmpty(e.Tag) ? 1 : 2;
 
     static bool IsLetter(char c) =>
         c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' || c >= (char)192;   // include accented range
@@ -85,6 +102,9 @@ internal static class Abbrev
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+            // one-time upgrade from the old "abbreviations" name
+            if (!File.Exists(FilePath) && File.Exists(OldFilePath))
+                File.Copy(OldFilePath, FilePath);
             if (!File.Exists(FilePath)) File.WriteAllText(FilePath, DefaultFile);
 
             var fi = new FileInfo(FilePath);
@@ -98,7 +118,7 @@ internal static class Abbrev
                 if (line.Length == 0 || line.StartsWith('#')) continue;
 
                 string abbr, expansion; string? tag = null; bool voiceTag = false;
-                var m = Regex.Match(line, @"^(.+?)\s*->\s*(.+?)\s*([#@])([\w.-]+)$");   // [\w.-] so #en-GB and @glados.onnx parse
+                var m = Regex.Match(line, @"^(.+?)\s*->\s*(.+?)\s*([#@])([\w.-]+)$");
                 if (m.Success)
                 {
                     abbr = m.Groups[1].Value.Trim().ToLowerInvariant();
@@ -122,12 +142,11 @@ internal static class Abbrev
         }
         catch (Exception ex)
         {
-            Log.Enqueue("abbreviations error: " + ex.Message);
+            Log.Enqueue("expansions error: " + ex.Message);
         }
     }
 
-    const string DefaultFile = @"
-# Abbreviations — applied to speech only; the display shows what you typed.
+    const string DefaultFile = @"# Expansions — applied to speech only; the display shows what you typed.
 #   abbr -> expansion           (every voice)
 #   abbr -> expansion #en       (any English voice: en-US, en-GB, ...)
 #   abbr -> expansion #en-GB    (country-specific: ONLY British voices)
@@ -135,6 +154,7 @@ internal static class Abbrev
 #                                e.g. the piper model glados.onnx)
 #   abbr -> expansion @zira     (SAPI voice names match too, by substring)
 # Longest abbreviation wins; it must not be surrounded by letters inside a word.
+# Ties go to the more specific tag: @voice over #lang over untagged.
 # This file reloads automatically the moment you save it.
 
 mb -> my bad #en

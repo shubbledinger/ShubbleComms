@@ -1,8 +1,8 @@
+![](screenshots/banner.png)
+
 # ShubbleComms
 
 Talk in voice chat without a microphone. ShubbleComms captures what you type, speaks it through a TTS voice, and plays the audio into a virtual microphone (such as ![VB-Audio Cable](https://vb-audio.com/Cable/index.htm)). Everything runs locally.
-
-![the radial soundboard](screenshots/wheel.png)
 
 ## Read this first
 
@@ -66,16 +66,18 @@ Two engines:
 - **SAPI** — Default Microsoft voices. Works out of the box; install more from language settings in Windows.
 - **Piper** — offline neural TTS. Runs 100% locally: no account, no download-at-runtime, no network. The release zip ships piper with a GLaDOS voice (the fan-made [dnhkng/GLaDOS](https://github.com/dnhkng/GLaDOS) model); extra voices are drag-and-drop into the voices folder. Building from source? [Add piper yourself](#building-from-source) — any piper voice works.
 
-Both engines get the same rate, pitch, and shout sliders, and both support per-voice abbreviation dictionaries — `brb -> be right back` for everyone, `glados -> gladdaus` for the one voice that says it wrong.
+Both engines get the same rate, pitch, and shout sliders, and both support per-voice expansion dictionaries — `brb -> be right back` for everyone, `glados -> gladdaus` for the one voice that says it wrong.
 
 ### Everything else
 
+![](screenshots/settings.png)
+
 - Multiple simultaneous outputs — tick several sound outputs and the voice goes to all of them
 - Every bind re-recordable: click the bind button, press a new key or mouse button
-- Themes (Dark, Matrix, Portal, Ice) — (not customizable for now, might include that functionality later)
+- Themes (Dark, Matrix, Portal, Ice) — plain JSON files in %APPDATA%\ShubbleComms\themes\: edit them, add your own, or drop a white-on-transparent PNG as a custom mode indicator
 - Starts minimized to the tray; double-click the tray icon for settings
 
-![settings](screenshots/settings.png)
+![](screenshots/themes.png)
 
 ## Getting started
 
@@ -117,14 +119,15 @@ In ShubbleComms settings, click voices folder — it opens `piper\voices`.
 
 **Files:**
 
-- Settings, abbreviations, soundboard: `%APPDATA%\ShubbleComms`
+- Settings, expansions, soundboard, message history: %APPDATA%\ShubbleComms
+- Themes: %APPDATA%\ShubbleComms\themes\ — JSON, one file per theme, "indicator" can name a PNG
 - Piper: `piper` next to the exe; voice models in piper\voices\ (the voices button in settings opens it)
 - `soundboard.txt` syntax:
   - `[Name]` starts a preset, one entry per line
-  - plain line = spoken phrase (abbreviations apply)
+  - plain line = spoken phrase (expansions apply)
   - `@airhorn.wav` = sound file, relative to the file itself (or absolute, or `~\Music\ding.wav`); `.wav .mp3 .m4a .aac .wma .aif`
   - live-reloads on save; 8 or fewer slots per preset reads best, 12 = clock face
-- `abbreviations.txt` syntax:
+- `expansions.txt` syntax:
   - `abbr -> expansion` — every voice
   - `abbr -> expansion #en` — any English voice; `#en-GB` — British only
   - `abbr -> expansion @glados` — only voices whose name contains "glados"

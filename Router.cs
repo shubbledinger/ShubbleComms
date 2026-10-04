@@ -53,6 +53,17 @@ internal sealed class KeyboardRouter : IDisposable
     // our own mirror of keyboard state, built from hook events
     readonly byte[] _ks = new byte[256];
 
+    // sent-message history: Up/Down in typing mode cycles through it.
+    // Owned by the hook thread; the UI thread goes through the public methods
+    // and persists it whenever HistDirty goes up.
+    readonly object _histLock = new();
+    readonly List<string> _history = new();
+    public volatile bool HistDirty;
+    int _histIdx = -1;               // -1 = live text (not cycling)
+    string? _histDraft;              // live text saved when cycling starts
+    int _histDraftWord;              // its spoken-marker position, restored with it
+    const int HistCap = 250;
+
     public volatile Mode Mode = Mode.Game;
     public volatile bool Tier1HoldAssert = false;
     public volatile bool StreamWords = true;
@@ -63,7 +74,10 @@ internal sealed class KeyboardRouter : IDisposable
     public volatile string UnspokenText = "";
     public volatile int Cursor, SelStart, SelEnd;
 
-    // bind slots: a key (vk >= 8) or a mouse button (1-6), plus modifiers
+    // bind slots: a key (vk >= 8) or a mouse button (1-6), plus modifiers.
+    // Declared modifiers must be held for the bind to fire; EXTRA held
+    // modifiers are ignored, so holding sprint/movement and tapping a bind
+    // still works. AltGr is a hard veto (it means a character is being typed).
     public volatile uint BindTypingVk = 0x70;
     public volatile bool BindTypingAlt, BindTypingCtrl, BindTypingShift;
     public volatile uint BindStreamVk = 0x45;
@@ -139,29 +153,27 @@ internal sealed class KeyboardRouter : IDisposable
 
     // ============ bind helpers (both hooks run on this same thread) ============
 
-    // Exact modifier match, with a self-heal: if the tracked state fails to match
-    // but disagrees with the OS's live physical state, re-derive from physical and
-    // try once more. Stale tracked modifiers would otherwise permanently break a
-    // bind — the bind key falls through to the focused app.
-    // GAME MODE ONLY: there, every key passes through the hook and the async
-    // table is ground truth. In TYPING mode every key is swallowed, the async
-    // table is blind, and syncing from it would ERASE held modifiers — pressing
-    // the Alt+E bind while Shift was held used to wipe Shift and turn
-    // everything lowercase until Shift was re-pressed.
-    // RMENU (AltGr) never counts as Alt, so AltGr+key can't fire an Alt bind on
-    // any layout that uses it (AZERTY, QWERTZ, Nordic, Polish, ...).
+    // A bind fires when its DECLARED modifiers are held — extra held modifiers
+    // are ignored, so holding sprint/movement keys while tapping a bind works.
+    // AltGr (RMENU) is a hard veto: it means the user is typing a character,
+    // not pressing a bind.
+    // Self-heal: if the tracked state fails the subset test but disagrees with
+    // the OS's live physical state, re-derive from physical and retry — stale
+    // tracked modifiers would otherwise permanently break a bind. GAME MODE
+    // ONLY: in typing mode every key is swallowed, the async table is blind,
+    // and syncing from it would erase held modifiers.
     bool ModsMatch(bool alt, bool ctrl, bool shift)
     {
-        if (MatchMods(alt, ctrl, shift)) return true;
+        if (ModsSubset(alt, ctrl, shift)) return true;
         if (Mode == Mode.Game && ModsDisagreeWithPhysical()) SyncFromPhysical();
-        return MatchMods(alt, ctrl, shift);
+        return ModsSubset(alt, ctrl, shift);
     }
 
-    bool MatchMods(bool alt, bool ctrl, bool shift) =>
-        (((_ks[Native.VK_LMENU] & 0x80) != 0) == alt) &&
+    bool ModsSubset(bool alt, bool ctrl, bool shift) =>
         (_ks[Native.VK_RMENU] & 0x80) == 0 &&
-        (((_ks[Native.VK_LCONTROL] & 0x80) != 0) == ctrl) &&
-        (((_ks[Native.VK_SHIFT] & 0x80) != 0) == shift);
+        (!alt || (_ks[Native.VK_LMENU] & 0x80) != 0) &&
+        (!ctrl || (_ks[Native.VK_LCONTROL] & 0x80) != 0) &&
+        (!shift || (_ks[Native.VK_SHIFT] & 0x80) != 0);
 
     // does our tracked state disagree with the live OS state on any modifier family?
     bool ModsDisagreeWithPhysical()
@@ -174,6 +186,36 @@ internal sealed class KeyboardRouter : IDisposable
                Track(Native.VK_RCONTROL) != Phys(Native.VK_RCONTROL) ||
                Track(Native.VK_LSHIFT) != Phys(Native.VK_LSHIFT) ||
                Track(Native.VK_RSHIFT) != Phys(Native.VK_RSHIFT);
+    }
+
+    static int ModCount(bool alt, bool ctrl, bool shift) =>
+        (alt ? 1 : 0) + (ctrl ? 1 : 0) + (shift ? 1 : 0);
+
+    // Which bind owns a key press? Several binds can match at once (a
+    // no-modifier bind matches even while Shift is held); the bind declaring
+    // the MOST modifiers wins, so F1 and Shift+F1 can coexist as binds.
+    // Key-form binds (vk >= 8) only answer keyboard events; mouse-form binds
+    // (vk 1-6) only mouse events — the callers pass the matching kind of vk.
+    // 0 = none, 1 = typing, 2 = stream, 3 = radial.
+    int BindOwner(uint vk)
+    {
+        int owner = 0, best = -1;
+        if (vk != 0 && vk == BindTypingVk && ModsMatch(BindTypingAlt, BindTypingCtrl, BindTypingShift))
+        {
+            int n = ModCount(BindTypingAlt, BindTypingCtrl, BindTypingShift);
+            if (n > best) { best = n; owner = 1; }
+        }
+        if (vk != 0 && vk == BindStreamVk && ModsMatch(BindStreamAlt, BindStreamCtrl, BindStreamShift))
+        {
+            int n = ModCount(BindStreamAlt, BindStreamCtrl, BindStreamShift);
+            if (n > best) { best = n; owner = 2; }
+        }
+        if (vk != 0 && vk == RadialTriggerVk && ModsMatch(RadialAlt, RadialCtrl, RadialShift))
+        {
+            int n = ModCount(RadialAlt, RadialCtrl, RadialShift);
+            if (n > best) { best = n; owner = 3; }
+        }
+        return owner;
     }
 
     static string BindName(uint vk) => vk switch
@@ -287,8 +329,9 @@ internal sealed class KeyboardRouter : IDisposable
 
     // ============ keyboard hook ============
 
-    // Which keys are captured into the text editor in TYPING mode. In full mode
-    // the list grows to include the navigation/editing keys.
+    // Which keys are captured into the text editor in TYPING mode. Up/Down are
+    // always captured (message history); the rest of the navigation set is
+    // full-mode only.
     static bool IsCaptureKey(uint vk, bool full)
     {
         if (vk >= 0xA0 && vk <= 0xA5) return true;                                    // modifiers
@@ -297,7 +340,8 @@ internal sealed class KeyboardRouter : IDisposable
         if (vk is >= 0x41 and <= 0x5A) return true;                                   // A-Z
         if (vk is >= 0x60 and <= 0x6E) return true;                                   // numpad
         if (vk is >= 0xBA and <= 0xE4) return true;                                   // punctuation
-        if (full && (vk is 0x23 or 0x24 or 0x2E || (vk >= 0x25 && vk <= 0x28))) return true;  // arrows/Home/End/Del
+        if (vk is 0x26 or 0x28) return true;                                          // Up/Down: history
+        if (full && (vk is 0x23 or 0x24 or 0x25 or 0x27 or 0x2E)) return true;         // Home/End/arrows/Delete
         return false;
     }
 
@@ -334,29 +378,16 @@ internal sealed class KeyboardRouter : IDisposable
             return (IntPtr)1;
         }
 
-        // ---- typing bind (key form) ----
-        if (k.vkCode == BindTypingVk && BindTypingVk >= 0x08 &&
-            ModsMatch(BindTypingAlt, BindTypingCtrl, BindTypingShift))
-        {
-            if (down && !_held.Contains(k.vkCode) && !RadialOpen) ToggleTyping();
-            if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
-            return (IntPtr)1;
-        }
+        // ---- binds (key form): declared modifiers held, extras ignored, most
+        // specific bind wins. The radial block also claims its trigger key
+        // while the wheel is open, so closing still works if the trigger's
+        // modifiers were released first ----
+        int owner = BindOwner(k.vkCode);
 
-        // ---- stream bind (key form) ----
-        if (k.vkCode == BindStreamVk && BindStreamVk >= 0x08 &&
-            ModsMatch(BindStreamAlt, BindStreamCtrl, BindStreamShift))
+        // ---- radial trigger (key form): hold opens / re-press closes (toggle mode) ----
+        if (owner == 3 || (RadialOpen && k.vkCode == RadialTriggerVk && RadialTriggerVk >= 0x08))
         {
-            if (down && !_held.Contains(k.vkCode)) SetStreamWords(!StreamWords);
-            if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
-            return (IntPtr)1;
-        }
-
-        // ---- radial trigger (key form): hold opens / toggle mode re-press closes ----
-        if (RadialTriggerVk >= 0x08 && k.vkCode == RadialTriggerVk)
-        {
-            if (down && !_held.Contains(k.vkCode) && !RadialOpen && Mode == Mode.Game &&
-                ModsMatch(RadialAlt, RadialCtrl, RadialShift))
+            if (down && !_held.Contains(k.vkCode) && !RadialOpen && Mode == Mode.Game)
             {
                 Native.GetCursorPos(out var cp);
                 OpenRadial(cp.x, cp.y);
@@ -371,6 +402,22 @@ internal sealed class KeyboardRouter : IDisposable
             {
                 RadialOpen = false;
             }
+            if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
+            return (IntPtr)1;
+        }
+
+        // ---- typing bind ----
+        if (owner == 1)
+        {
+            if (down && !_held.Contains(k.vkCode) && !RadialOpen) ToggleTyping();
+            if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
+            return (IntPtr)1;
+        }
+
+        // ---- stream bind ----
+        if (owner == 2)
+        {
+            if (down && !_held.Contains(k.vkCode)) SetStreamWords(!StreamWords);
             if (down) _held.Add(k.vkCode); else if (up) _held.Remove(k.vkCode);
             return (IntPtr)1;
         }
@@ -425,12 +472,16 @@ internal sealed class KeyboardRouter : IDisposable
 
                 if (k.vkCode == Native.VK_ESCAPE && !repeat)
                 {
-                    lock (_textLock) ClearText();   // Esc clears the box; the bind key closes it
+                    lock (_textLock) { ClearText(); BreakHist(); }   // Esc clears; the bind key closes
                     Snapshot();
                     return (IntPtr)1;
                 }
 
-                bool ctrl = (_ks[Native.VK_CONTROL] & 0x80) != 0;
+                // AltGr arrives as Ctrl+RAlt — a key typed under AltGr is a
+                // CHARACTER (€, @, ...), never a Ctrl shortcut, so every Ctrl
+                // check below must ignore the synthesized Ctrl while AltGr is held
+                bool altgr = (_ks[Native.VK_RMENU] & 0x80) != 0;
+                bool ctrl = !altgr && (_ks[Native.VK_CONTROL] & 0x80) != 0;
                 bool shift = (_ks[Native.VK_SHIFT] & 0x80) != 0;
 
                 switch (k.vkCode)
@@ -438,6 +489,7 @@ internal sealed class KeyboardRouter : IDisposable
                     case Native.VK_SPACE:
                         lock (_textLock)
                         {
+                            BreakHist();
                             if (full) { DeleteSel(); _text.Insert(_cursor, " "); _cursor++; _anchor = _cursor; }
                             else { _text.Append(' '); _anchor = _cursor = _text.Length; SubmitWord(); }
                         }
@@ -448,14 +500,16 @@ internal sealed class KeyboardRouter : IDisposable
                         if (repeat) break;
                         lock (_textLock)
                         {
+                            string message = _text.ToString().Trim();
                             if (StreamWords) { SubmitWord(); ClearText(); }
                             else
                             {
-                                string whole = _text.ToString().Trim();
-                                if (whole.Length > 0) _tts?.Speak(whole);
+                                if (message.Length > 0) _tts?.Speak(message);
                                 ClearText();
                             }
+                            AppendHistory(message);
                         }
+                        BreakHist();
                         Snapshot();
                         ToggleTyping();
                         break;
@@ -463,6 +517,7 @@ internal sealed class KeyboardRouter : IDisposable
                     case Native.VK_BACK:
                         lock (_textLock)
                         {
+                            BreakHist();
                             if (ctrl)
                             {
                                 int target = WordBack(_cursor);
@@ -484,6 +539,7 @@ internal sealed class KeyboardRouter : IDisposable
                         if (!full) break;
                         lock (_textLock)
                         {
+                            BreakHist();
                             if (_anchor != _cursor) DeleteSel();
                             else if (_cursor < _text.Length)
                             {
@@ -495,17 +551,41 @@ internal sealed class KeyboardRouter : IDisposable
                         break;
 
                     case Native.VK_HOME:
-                    case Native.VK_UP:
                         if (!full) break;
                         lock (_textLock) { _cursor = _wordStart; if (!shift) _anchor = _cursor; }
                         Snapshot();
                         break;
 
                     case Native.VK_END:
-                    case Native.VK_DOWN:
                         if (!full) break;
                         lock (_textLock) { _cursor = _text.Length; if (!shift) _anchor = _cursor; }
                         Snapshot();
+                        break;
+
+                    // Up/Down cycle the message history; Ctrl+Up/Down jump to the
+                    // beginning/end of the text (full mode only)
+                    case Native.VK_UP:
+                        if (ctrl && full)
+                        {
+                            lock (_textLock) { _cursor = _wordStart; if (!shift) _anchor = _cursor; }
+                            Snapshot();
+                        }
+                        else if (!ctrl)
+                        {
+                            HistoryStep(-1);
+                        }
+                        break;
+
+                    case Native.VK_DOWN:
+                        if (ctrl && full)
+                        {
+                            lock (_textLock) { _cursor = _text.Length; if (!shift) _anchor = _cursor; }
+                            Snapshot();
+                        }
+                        else if (!ctrl)
+                        {
+                            HistoryStep(1);
+                        }
                         break;
 
                     case Native.VK_LEFT:
@@ -529,6 +609,7 @@ internal sealed class KeyboardRouter : IDisposable
                         break;
 
                     default:
+                        BreakHist();
                         if (ctrl && k.vkCode >= 0x41 && k.vkCode <= 0x5A)
                         {
                             if (full) CtrlLetter(k.vkCode);
@@ -621,23 +702,22 @@ internal sealed class KeyboardRouter : IDisposable
             return (IntPtr)1;
         }
 
-        // ---- binds (mouse-button form) + radial trigger ----
+        // ---- binds (mouse form): same rules as the key form — declared
+        // modifiers held, extras ignored, most specific bind wins ----
         if (isDown && bvk != 0)
         {
-            if (bvk == BindTypingVk && BindTypingVk <= 0x06 &&
-                ModsMatch(BindTypingAlt, BindTypingCtrl, BindTypingShift) && !RadialOpen)
+            int owner = BindOwner(bvk);
+            if (owner == 1 && !RadialOpen)
             {
                 ToggleTyping();
                 return (IntPtr)1;
             }
-            if (bvk == BindStreamVk && BindStreamVk <= 0x06 &&
-                ModsMatch(BindStreamAlt, BindStreamCtrl, BindStreamShift))
+            if (owner == 2)
             {
                 SetStreamWords(!StreamWords);
                 return (IntPtr)1;
             }
-            if (bvk == RadialTriggerVk && RadialTriggerVk <= 0x06 && Mode == Mode.Game &&
-                ModsMatch(RadialAlt, RadialCtrl, RadialShift))
+            if (owner == 3 && Mode == Mode.Game)
             {
                 if (RadialOpen && RadialToggle)
                 {
@@ -669,7 +749,7 @@ internal sealed class KeyboardRouter : IDisposable
                 return (IntPtr)1;
             }
 
-            // toggle mode: LMB fires the hovered wedge, wheel stays open
+            // toggle mode: LMB fires the hovered wedge while the wheel stays open
             if (msg == Native.WM_LBUTTONDOWN)
             {
                 if (RadialToggle) RadialFireRequest = true;
@@ -692,7 +772,7 @@ internal sealed class KeyboardRouter : IDisposable
                 short d = (short)(m.mouseData >> 16);
                 _wheelAcc += d;
                 while (_wheelAcc >= 120) { RadialWheelNotches++; _wheelAcc -= 120; }
-                while (_wheelAcc <= -120) { RadialWheelNotches--; _wheelAcc += 120; }
+                while (_wheelAcc <= -120) { RadialWheelNotches--; _wheelAcc -= 120; }
                 Injector.MouseWheel(-d);   // counter-spin so the game's weapon wheel doesn't move
                 return (IntPtr)1;
             }
@@ -752,33 +832,23 @@ internal sealed class KeyboardRouter : IDisposable
 
     // Translate a keypress into characters using the FOREGROUND app's keyboard
     // layout (correct for AZERTY etc.).
-    // Modifier state = live physical (async) OR our own hook tracking. The async
-    // table doesn't reflect keys the hook swallowed — and TYPING mode swallows
-    // EVERY key, so a Shift pressed mid-message read as "not held" and everything
-    // came out lowercase. Our tracker sees every event the hook sees; OR them so
-    // neither blind spot can blank the modifiers. L and R stay distinct so AltGr
-    // is never conflated with left Alt.
+    // Modifier state comes from our own hook tracking ONLY. In typing mode every
+    // modifier keydown/keyup is swallowed before it reaches the OS, so the async
+    // table is FROZEN at whatever it held when typing mode opened — a Shift held
+    // at open and released mid-message used to read as permanently held (stuck
+    // caps). The tracked state is seeded from the OS when typing mode opens
+    // (SyncFromPhysical) and then sees every event, so it stays live in both
+    // directions. L and R modifiers stay distinct in _ks, so AltGr is never
+    // conflated with left Alt.
     string ToChars(Native.KBDLLHOOKSTRUCT k)
     {
         var ks = (byte[])_ks.Clone();
-
-        bool la = Async(0xA4) || (_ks[0xA4] & 0x80) != 0;
-        bool ra = Async(0xA5) || (_ks[0xA5] & 0x80) != 0;
-        bool lc = Async(0xA2) || (_ks[0xA2] & 0x80) != 0;
-        bool rc = Async(0xA3) || (_ks[0xA3] & 0x80) != 0;
-        bool sh = (Async(0xA0) || (_ks[0xA0] & 0x80) != 0) ||
-                  (Async(0xA1) || (_ks[0xA1] & 0x80) != 0);
-        ks[0x12] = (la || ra) ? (byte)0xFF : (byte)0; ks[0xA4] = la ? (byte)0xFF : (byte)0; ks[0xA5] = ra ? (byte)0xFF : (byte)0;
-        ks[0x11] = (lc || rc) ? (byte)0xFF : (byte)0; ks[0xA2] = lc ? (byte)0xFF : (byte)0; ks[0xA3] = rc ? (byte)0xFF : (byte)0;
-        ks[0x10] = sh ? (byte)0xFF : (byte)0; ks[0xA0] = sh ? (byte)0xFF : (byte)0; ks[0xA1] = sh ? (byte)0xFF : (byte)0;
 
         ks[Native.VK_CAPITAL] = (byte)(Native.GetKeyState((int)Native.VK_CAPITAL) & 1);
         var sb = new StringBuilder(8);
         int n = Native.ToUnicodeEx(k.vkCode, k.scanCode, ks, sb, sb.Capacity, 0, CurrentLayout());
         return n > 0 ? sb.ToString(0, n) : "";
     }
-
-    static bool Async(int vk) => (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
 
     static IntPtr CurrentLayout()
     {
@@ -886,6 +956,103 @@ internal sealed class KeyboardRouter : IDisposable
             Cursor = _cursor; SelStart = _anchor; SelEnd = _cursor;
         }
     }
+
+    // ============ message history ============
+
+    // Up/Down cycle through previously sent messages. The live draft (including
+    // its spoken/unspoken split) is saved when cycling starts and restored when
+    // you come back past the newest entry. Any edit ends the cycle: the loaded
+    // text becomes the new live text.
+    void HistoryStep(int dir)
+    {
+        lock (_textLock)
+        {
+            Normalize();
+            List<string> hist;
+            lock (_histLock) hist = new List<string>(_history);
+            if (hist.Count == 0) return;
+
+            if (dir < 0)
+            {
+                if (_histIdx < 0)
+                {
+                    _histDraft = _text.ToString();
+                    _histDraftWord = _wordStart;
+                    _histIdx = hist.Count - 1;
+                }
+                else if (_histIdx > 0) _histIdx--;
+                else return;                          // already at the oldest
+            }
+            else
+            {
+                if (_histIdx < 0) return;             // not cycling
+                _histIdx++;
+                if (_histIdx >= hist.Count)
+                {
+                    // past the newest: restore the saved draft
+                    _histIdx = -1;
+                    ClearText();
+                    if (_histDraft != null)
+                    {
+                        _text.Append(_histDraft);
+                        _wordStart = Math.Min(_histDraftWord, _text.Length);
+                    }
+                    _histDraft = null;
+                    _cursor = _anchor = _text.Length;
+                    Snapshot();
+                    return;
+                }
+            }
+
+            ClearText();
+            _text.Append(hist[_histIdx]);
+            _cursor = _anchor = _text.Length;
+            Snapshot();
+        }
+    }
+
+    // any edit ends history cycling — the loaded text becomes the live draft
+    void BreakHist()
+    {
+        _histIdx = -1;
+        _histDraft = null;
+    }
+
+    // called on Enter — the sent message joins the history
+    void AppendHistory(string message)
+    {
+        if (message.Length == 0) return;
+        lock (_histLock)
+        {
+            if (_history.Count == 0 || _history[^1] != message)
+                _history.Add(message);
+            while (_history.Count > HistCap) _history.RemoveAt(0);
+        }
+        HistDirty = true;
+    }
+
+    // history is owned by the hook thread; the UI thread goes through these
+    public void LoadHistory(List<string> messages)
+    {
+        lock (_histLock)
+        {
+            _history.Clear();
+            _history.AddRange(messages);
+            while (_history.Count > HistCap) _history.RemoveAt(0);
+        }
+    }
+
+    public List<string> HistorySnapshot()
+    {
+        lock (_histLock) return new List<string>(_history);
+    }
+
+    public void ClearHistory()
+    {
+        lock (_histLock) _history.Clear();
+    }
+
+    // ============ mode switching ============
 
     void ToggleTyping()
     {
